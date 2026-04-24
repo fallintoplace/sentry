@@ -485,6 +485,7 @@ INSTALLED_APPS: tuple[str, ...] = (
     "sentry.sentry_metrics",
     "sentry.sentry_metrics.indexer.postgres.apps.Config",
     "sentry.snuba",
+    "sentry.lang.native.apps.Config",
     "social_auth",
     "sudo",
     "sentry.eventstream",
