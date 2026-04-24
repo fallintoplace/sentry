@@ -53,6 +53,13 @@ x-sentry-service-config:
         branch: master
         repo_link: https://github.com/getsentry/symbolicator.git
         mode: default
+    teapot:
+      description: GPU crash dump symbolication service (sibling to symbolicator)
+      remote:
+        repo_name: teapot
+        branch: main
+        repo_link: https://github.com/getsentry/teapot.git
+        mode: default
     launchpad:
       description: Service for analyzing iOS and Android apps
       remote:
