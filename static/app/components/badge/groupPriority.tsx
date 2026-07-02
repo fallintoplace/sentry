@@ -32,6 +32,10 @@ type GroupPriorityDropdownProps = {
   value: PriorityLevel;
   disabled?: boolean;
   lastEditedBy?: 'system' | AvatarUser;
+  trigger?: (
+    triggerProps: React.HTMLAttributes<HTMLElement>,
+    isOpen: boolean
+  ) => React.ReactNode;
 };
 
 type GroupPriorityBadgeProps = {
@@ -191,6 +195,7 @@ export function GroupPriorityDropdown({
   onChange,
   lastEditedBy,
   disabled = false,
+  trigger: customTrigger,
 }: GroupPriorityDropdownProps) {
   const options: MenuItemProps[] = useMemo(
     () => makeGroupPriorityDropdownOptions({onChange}),
@@ -206,23 +211,31 @@ export function GroupPriorityDropdown({
         </Flex>
       }
       minMenuWidth={230}
-      trigger={(triggerProps, isOpen) => (
-        <DropdownButton
-          {...triggerProps}
-          aria-label={t('Modify issue priority')}
-          size="zero"
-          disabled={disabled}
-          tooltipProps={{
-            title: disabled
-              ? t('You cannot manually update the priority of a metric issue.')
-              : t('Update the priority of this issue.'),
-          }}
-        >
-          <GroupPriorityBadge showLabel={false} priority={value}>
-            <IconChevron direction={isOpen ? 'up' : 'down'} size="xs" variant="muted" />
-          </GroupPriorityBadge>
-        </DropdownButton>
-      )}
+      trigger={(triggerProps, isOpen) =>
+        customTrigger ? (
+          customTrigger(triggerProps, isOpen)
+        ) : (
+          <DropdownButton
+            {...triggerProps}
+            aria-label={t('Modify issue priority')}
+            size="zero"
+            disabled={disabled}
+            tooltipProps={{
+              title: disabled
+                ? t('You cannot manually update the priority of a metric issue.')
+                : t('Update the priority of this issue.'),
+            }}
+          >
+            <GroupPriorityBadge showLabel={false} priority={value}>
+              <IconChevron
+                direction={isOpen ? 'up' : 'down'}
+                size="xs"
+                variant="muted"
+              />
+            </GroupPriorityBadge>
+          </DropdownButton>
+        )
+      }
       items={options}
       menuFooter={
         <Fragment>

@@ -1,3 +1,5 @@
+import type React from 'react';
+
 import {bulkUpdate} from 'sentry/actionCreators/group';
 import {
   addErrorMessage,
@@ -19,6 +21,10 @@ import {useOrganization} from 'sentry/utils/useOrganization';
 type GroupDetailsPriorityProps = {
   group: Group;
   onChange?: (priority: PriorityLevel) => void;
+  trigger?: (
+    triggerProps: React.HTMLAttributes<HTMLElement>,
+    isOpen: boolean
+  ) => React.ReactNode;
 };
 
 const PRIORITY_BARS: Record<PriorityLevel, 1 | 2 | 3> = {
@@ -73,7 +79,7 @@ function useChangePriority(group: Group, onChange?: (priority: PriorityLevel) =>
   };
 }
 
-export function GroupPriority({group, onChange}: GroupDetailsPriorityProps) {
+export function GroupPriority({group, onChange, trigger}: GroupDetailsPriorityProps) {
   const onChangePriority = useChangePriority(group, onChange);
 
   // We can assume that when there is not `priorityLockedAt`, there were no
@@ -87,6 +93,7 @@ export function GroupPriority({group, onChange}: GroupDetailsPriorityProps) {
       onChange={onChangePriority}
       value={group.priority ?? PriorityLevel.MEDIUM}
       lastEditedBy={lastEditedBy}
+      trigger={trigger}
     />
   );
 }

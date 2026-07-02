@@ -414,7 +414,7 @@ function InboxDetail({groupId}: InboxDetailProps) {
       <DetailBody>
         <GroupDataContextProvider group={group} project={project}>
           <ErrorBoundary mini>
-            <IssuePreviewContent />
+            <IssuePreviewContent fullWidthTabs />
           </ErrorBoundary>
         </GroupDataContextProvider>
       </DetailBody>
@@ -673,7 +673,7 @@ const DetailBody = styled('div')`
   flex: 1;
   overflow-y: auto;
   scrollbar-width: none;
-  padding: ${p => p.theme.space.lg};
+  padding: ${p => p.theme.space.lg} 0;
 
   &::-webkit-scrollbar {
     display: none;

@@ -30,12 +30,14 @@ interface GroupHeaderAssigneeSelectorProps {
   event: Event | null;
   group: Group;
   project: Project;
+  showLabel?: boolean;
 }
 
 export function GroupHeaderAssigneeSelector({
   group,
   project,
   event,
+  showLabel = true,
 }: GroupHeaderAssigneeSelectorProps) {
   const theme = useTheme();
   const organization = useOrganization();
@@ -65,7 +67,7 @@ export function GroupHeaderAssigneeSelector({
       owners={owners}
       assigneeLoading={assigneeLoading}
       handleAssigneeChange={handleAssigneeChange}
-      showLabel
+      showLabel={showLabel}
       additionalMenuFooterItems={
         <MenuComponents.CTAButton
           onClick={() => {
