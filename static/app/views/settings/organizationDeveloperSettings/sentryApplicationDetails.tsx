@@ -61,25 +61,10 @@ import {displayNewToken} from 'sentry/views/settings/components/newTokenHandler'
 import {BreadcrumbTitle} from 'sentry/views/settings/components/settingsBreadcrumb/breadcrumbTitle';
 import {EVENT_CHOICES} from 'sentry/views/settings/organizationDeveloperSettings/constants';
 import {PermissionsObserver} from 'sentry/views/settings/organizationDeveloperSettings/permissionsObserver';
-
-const AVATAR_STYLES = {
-  color: {
-    label: t('Default logo'),
-    description: t('The default icon for integrations'),
-    help: t('Image must be between 256px by 256px and 1024px by 1024px.'),
-  },
-  simple: {
-    label: t('Default small icon'),
-    description: tct('This is a silhouette icon used only for [uiDocs:UI Components]', {
-      uiDocs: (
-        <ExternalLink href="https://docs.sentry.io/product/integrations/integration-platform/ui-components/" />
-      ),
-    }),
-    help: t(
-      'Image must be between 256px by 256px and 1024px by 1024px, and may only use black and transparent pixels.'
-    ),
-  },
-};
+import {
+  SENTRY_APP_AVATAR_STYLES,
+  SentryAppAvatarField,
+} from 'sentry/views/settings/organizationDeveloperSettings/sentryAppAvatarField';
 
 const sentryAppFormSchema = z
   .object({
@@ -297,6 +282,9 @@ function SentryApplicationForm({
 
   const sentryAppQueryOptions = sentryAppApiOptions({appSlug: appSlug ?? null});
 
+  const hasNewBranding =
+    !!app && organization.features.includes('sentry-app-branding-v2');
+
   const [newTokens, setNewTokens] = useState<NewInternalAppApiToken[]>([]);
   const [scopeErrors, setScopeErrors] = useState<ScopeErrors>({permissions: {}});
 
@@ -481,13 +469,21 @@ function SentryApplicationForm({
     }
   };
 
+  const applyAvatars = (updated: SentryApp) => {
+    if (app) {
+      queryClient.setQueryData(sentryAppQueryOptions.queryKey, {
+        json: {...app, avatars: updated.avatars},
+        headers: {},
+      });
+    }
+  };
+
   const getAvatarChooser = (isColor: boolean) => {
     if (!app) {
       return null;
     }
 
-    const avatarStyle = isColor ? 'color' : 'simple';
-    const styleProps = AVATAR_STYLES[avatarStyle];
+    const styleProps = SENTRY_APP_AVATAR_STYLES[isColor ? 'logo' : 'icon'];
 
     return (
       <AvatarChooser
@@ -496,7 +492,7 @@ function SentryApplicationForm({
         type={isColor ? 'sentryAppColor' : 'sentryAppSimple'}
         model={app}
         onSave={addAvatar}
-        title={isColor ? t('Logo') : t('Small Icon')}
+        title={styleProps.title}
         help={styleProps.help.concat(isInternal ? '' : t(' Required for publishing.'))}
         defaultChoice={{
           label: styleProps.label,
@@ -660,6 +656,23 @@ function SentryApplicationForm({
               </field.Layout.Row>
             )}
           </form.AppField>
+        )}
+
+        {hasNewBranding && app && (
+          <Fragment>
+            <SentryAppAvatarField
+              app={app}
+              photoType="logo"
+              isInternal={isInternal}
+              onSave={applyAvatars}
+            />
+            <SentryAppAvatarField
+              app={app}
+              photoType="icon"
+              isInternal={isInternal}
+              onSave={applyAvatars}
+            />
+          </Fragment>
         )}
 
         <form.AppField
@@ -831,8 +844,12 @@ function SentryApplicationForm({
         </form.AppField>
       </form.FieldGroup>
 
-      {getAvatarChooser(true)}
-      {getAvatarChooser(false)}
+      {!hasNewBranding && (
+        <Fragment>
+          {getAvatarChooser(true)}
+          {getAvatarChooser(false)}
+        </Fragment>
+      )}
 
       <form.Subscribe selector={state => isInternal && !state.values.webhookUrl}>
         {webhookDisabled => (
