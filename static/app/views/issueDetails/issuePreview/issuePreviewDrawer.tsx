@@ -31,6 +31,8 @@ import {IssueIdBreadcrumb} from 'sentry/views/issueDetails/header/issueIdBreadcr
 import {useAiConfig} from 'sentry/views/issueDetails/hooks/useAiConfig';
 import {IssuePreviewAutofix} from 'sentry/views/issueDetails/issuePreview/issuePreviewAutofix';
 import {IssuePreviewDetails} from 'sentry/views/issueDetails/issuePreview/issuePreviewDetails';
+import {EventList} from 'sentry/views/issueDetails/eventList';
+import {useSyncedLocalStorageState} from 'sentry/utils/useSyncedLocalStorageState';
 import {useGroup} from 'sentry/views/issueDetails/useGroup';
 import {
   getGroupReprocessingStatus,
@@ -81,9 +83,13 @@ export function IssuePreviewDrawer({groupId}: IssuePreviewDrawerProps) {
   );
 }
 
-function IssuePreviewContent() {
+const INBOX_TAB_KEY = 'issue-inbox-selected-tab';
+
+export function IssuePreviewContent() {
   const {group, project} = useGroupData();
   const {hasAutofix} = useAiConfig(group, project);
+  const [activeTab, setActiveTab] = useSyncedLocalStorageState(INBOX_TAB_KEY, 'activity');
+
   const {title: primaryTitle} = getTitle(group);
   const secondaryTitle = getMessage(group);
   const disableActions = [
@@ -147,7 +153,7 @@ function IssuePreviewContent() {
         </Flex>
       </Flex>
       <Container paddingTop="md">
-        <Tabs>
+        <Tabs value={activeTab} onChange={setActiveTab}>
           <Container paddingBottom="md" borderBottom="muted">
             <TabList variant="floating">
               <TabList.Item key="activity">{t('Activity')}</TabList.Item>
@@ -155,9 +161,7 @@ function IssuePreviewContent() {
                 <TabList.Item key="autofix">{t('Autofix')}</TabList.Item>
               ) : null}
               <TabList.Item key="details">{t('Details')}</TabList.Item>
-              <TabList.Item key="events" disabled>
-                {t('Events')}
-              </TabList.Item>
+              <TabList.Item key="events">{t('Events')}</TabList.Item>
             </TabList>
           </Container>
           <TabPanels>
@@ -186,7 +190,9 @@ function IssuePreviewContent() {
               </Container>
             </TabPanels.Item>
             <TabPanels.Item key="events">
-              <div />
+              <Container paddingTop="md">
+                <EventList group={group} />
+              </Container>
             </TabPanels.Item>
           </TabPanels>
         </Tabs>
