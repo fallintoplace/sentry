@@ -20,6 +20,7 @@ from sentry.models.pullrequest import (
     PullRequestAttribution,
     PullRequestLifecycleState,
     PullRequestMetrics,
+    PullRequestVerdict,
 )
 
 _PR_ACTIVITY_ATTRIBUTION_BUFFER = timedelta(hours=30)
@@ -164,6 +165,31 @@ def _commit_shas_from_activity(pull_request: PullRequest) -> set[str]:
         expected_after = before_sha
 
     return shas
+
+
+def _claim_terminal_event(pr: PullRequest, verdict: PullRequestVerdict) -> bool:
+    """Atomically claim a PR's terminal (close/merge) event for emission.
+
+    The redelivery guard. GitHub redelivers webhooks, and
+    ``PullRequestEventWebhook._handle`` stamps ``closed_at``/``state`` from every
+    payload, so the PR row can't tell whether the terminal event was already
+    processed. The pipeline-owned ``PullRequestMetrics.verdict`` can: it stays
+    null until we settle one, so a compare-and-set on ``verdict IS NULL`` lets
+    exactly one delivery claim the event and write ``verdict``, even under
+    concurrent redeliveries. Returns True if this call won the claim.
+
+    The verdict is never cleared, so the guard coalesces *every* repeat terminal
+    event to that one claim — not just GitHub redeliveries but also a reopen
+    followed by another close/merge. That's deliberate: we emit one analytics row
+    per PR (its first terminal state is authoritative), since multiple emissions
+    have meant costly dedup downstream for little benefit. A PR reopened after a
+    close and later merged is thus recorded by its first close — an accepted loss
+    on the rare reopened PR.
+    """
+    claimed = PullRequestMetrics.objects.filter(pull_request=pr, verdict__isnull=True).update(
+        verdict=verdict
+    )
+    return bool(claimed)
 
 
 def resolved_group_ids(pull_request: PullRequest) -> list[int]:

@@ -11,6 +11,8 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+from django.utils import timezone as dj_timezone
+
 from sentry import analytics
 from sentry.analytics.events.pr_metrics_events import PrCloseMetricsEvent
 from sentry.models.commit import Commit
@@ -25,12 +27,17 @@ from sentry.models.pullrequest import (
 )
 from sentry.pr_metrics.attribution import SIGNAL_TYPE_CONFIDENCE
 from sentry.pr_metrics.contracts import (
+    CLOSE_ACTION_ABANDONED,
     CLOSE_ACTION_CLOSED,
     CLOSE_ACTION_MERGED,
     CloseAction,
     PrConversationAnalysis,
 )
-from sentry.pr_metrics.utils import is_activity_tracking_enabled, iso_or_none, resolved_group_ids
+from sentry.pr_metrics.utils import (
+    is_activity_tracking_enabled,
+    iso_or_none,
+    resolved_group_ids,
+)
 from sentry.utils import json, metrics
 
 logger = logging.getLogger(__name__)
@@ -49,9 +56,10 @@ def select_verdict(
       is the opened head, so nothing changed, by anyone. A merge with later commits
       is ambiguous (Seer's own iteration vs. external changes) and needs the
       diff-similarity judge.
-    - Closed with no engagement — no later commits, comments, or review comments →
-      ``closed_unmerged``: an abandoned PR with nothing to analyze. A close with any
-      engagement needs the conversation judge to decide why it was closed.
+    - No engagement — no later commits, comments, or review comments:
+      - If the PR was closed → ``closed_unmerged``: nothing to analyze.
+      - If the PR is still open (stale detection path) → ``abandoned``.
+      Either way, a PR with any engagement needs the conversation judge.
 
     The commits-after-open signal is a ``SYNCHRONIZED`` activity row, one per push
     to the PR branch after it opened. Those rows are only written under
@@ -90,7 +98,12 @@ def select_verdict(
     has_discussion = bool(metrics_row.comments_count or metrics_row.review_comments_count)
     if has_commits_after_open or has_discussion:
         return None
-    return PullRequestVerdict.CLOSED_UNMERGED
+
+    return (
+        PullRequestVerdict.CLOSED_UNMERGED
+        if pull_request.closed_at is not None
+        else PullRequestVerdict.ABANDONED
+    )
 
 
 def is_pr_tracked(pull_request: PullRequest) -> bool:
@@ -175,7 +188,7 @@ def build_pr_metrics_row(
     conversation_analysis: PrConversationAnalysis | None = None,
     diagnosis_labels: Sequence[str] | None = None,
 ) -> PrCloseMetricsEvent:
-    """Assemble the close/merge analytics row.
+    """Assemble the close/merge/abandoned analytics row.
 
     Every fact is read from the stored ``PullRequest`` / ``PullRequestMetrics``
     rows, so the judge path (Seer RPC callback, which has no webhook payload) can
@@ -183,17 +196,19 @@ def build_pr_metrics_row(
     emitted row read the same query. A missing metrics row (a PR Sentry never saw
     active) coalesces every counter to its default.
 
+    For ``abandoned``, ``closed_at`` is set to the current UTC time (the
+    detection timestamp), since the PR is still open and the field is null on
+    the model. For close/merge, ``pull_request.closed_at`` is used and must be
+    non-null.
+
     The judge enrichment is set on the judge path only: ``conversation_analysis``
     is the conversation judge's result (semantic outputs become columns, its
     ``metadata`` is JSON-encoded), and ``diagnosis_labels`` is the cross-judge
     close-reason "why".
     """
-    head_commit_sha = pull_request.head_commit_sha
-    closed_at = pull_request.closed_at
-    if head_commit_sha is None or closed_at is None:
-        # The webhook always persists both on a close/merge; a null here means
-        # emit ran on a PR that never reached a terminal state. Fail loud.
-        raise ValueError("PR metrics row requires a persisted head_commit_sha and closed_at")
+    head_commit_sha = pull_request.head_commit_sha or "unknown"
+    # For abandoned PRs there's no `closed_at` value populated; fall back to now().
+    effective_closed_at = pull_request.closed_at or dj_timezone.now()
 
     # A bare instance carries the model's zero/false field defaults, so a PR with
     # no stored metrics row emits zeroed counters rather than erroring.
@@ -209,7 +224,7 @@ def build_pr_metrics_row(
         group_ids=group_ids,
         close_action=close_action,
         head_commit_sha=head_commit_sha,
-        closed_at=closed_at.isoformat(),
+        closed_at=effective_closed_at.isoformat(),
         merge_commit_sha=pull_request.merge_commit_sha,
         merge_commit_id=_merge_commit_id(pull_request),
         merged_at=iso_or_none(pull_request.merged_at),
@@ -276,6 +291,11 @@ def emit_pr_metrics_row(
     Takes only the canonical ``PullRequest`` — no webhook payload — so Seer's
     judge can call it directly via RPC callback. ``conversation_analysis`` and
     ``diagnosis_labels`` are set only on that judge path.
+
+    ``close_action`` is derived from the PR's lifecycle fields:
+    - ``merged_at`` set → ``merged``
+    - ``closed_at`` set, not merged → ``closed``
+    - both null → ``abandoned`` (still-open stale PR detected by cron)
     """
     # Fetch the attribution snapshot once: it both gates emission (≥1 valid row)
     # and rides along on the emitted row, so the two can't diverge.
@@ -292,9 +312,13 @@ def emit_pr_metrics_row(
         **_activity_derived_counters(pull_request)
     )
 
-    close_action: CloseAction = (
-        CLOSE_ACTION_MERGED if pull_request.merged_at is not None else CLOSE_ACTION_CLOSED
-    )
+    if pull_request.merged_at is not None:
+        close_action: CloseAction = CLOSE_ACTION_MERGED
+    elif pull_request.closed_at is not None:
+        close_action = CLOSE_ACTION_CLOSED
+    else:
+        close_action = CLOSE_ACTION_ABANDONED
+
     row = build_pr_metrics_row(
         pull_request=pull_request,
         close_action=close_action,
@@ -314,7 +338,7 @@ def emit_pr_metrics_row(
             "close_action": close_action,
         },
     )
-    # Imported here to avoid a circular import: tasks → judge → emit.
+    # Imported here to avoid a circular import: tasks → emit.
     from sentry.pr_metrics.tasks import cleanup_pr_activity_task
 
     cleanup_pr_activity_task.delay(pull_request_id=pull_request.id)
