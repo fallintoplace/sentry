@@ -123,7 +123,7 @@ export default function AutofixIssuesDemo() {
             <Stack gap="md">
               {answered.map(q => (
                 <Stack key={q.key} gap="xs">
-                  <Heading as="h4">{q.key}</Heading>
+                  <Heading as="h4">{q.question ?? q.key}</Heading>
                   <SeerMarkdown raw={q.answer} />
                 </Stack>
               ))}

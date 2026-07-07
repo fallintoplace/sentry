@@ -29,6 +29,14 @@ function withRequiredFilter(query: string): string {
 // ``group:[...]`` filter so we only fetch runs for the issues on the page.
 const RUNS_QUERY = 'type:explorer source:autofix';
 
+// Custom one-shot question asked about each run, sent to the endpoint as a
+// repeatable `question` param (see organization_seer_runs.py). Edit this list
+// to iterate on prompts without a backend change. Capped at 5 by the endpoint.
+const DEMO_QUESTIONS = [
+  'What was the most important bit of evidence while investigating this issue?',
+  'What is the complexity of the fix? Count or estimate number of lines and files touched.',
+];
+
 // Keep the issue page size at/under the runs endpoint's outputs page cap (10)
 // so a single runs request covers every group on the page.
 const PER_PAGE = 10;
@@ -86,6 +94,8 @@ export function deriveAutofixPhase(
 interface RunQuestion {
   answer: string;
   key: string;
+  // The question text, echoed back only for user-supplied questions.
+  question?: string;
 }
 
 // Subset of the runs list response we consume
@@ -169,7 +179,7 @@ export function useAutofixIssues({
       path: runsEnabled ? {organizationIdOrSlug: organization.slug} : skipToken,
       query: {
         query: `${RUNS_QUERY} group:[${groupIds.join(',')}]`,
-        outputs: 1,
+        question: DEMO_QUESTIONS,
       },
       staleTime: 30_000,
     })
