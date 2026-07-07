@@ -278,11 +278,12 @@ class DetectStalePullRequestsTaskTest(TestCase):
         assert metrics.verdict == PullRequestVerdict.ABANDONED
         mock_emit.assert_called_once()
 
-    def test_forwards_to_judge_when_pr_has_activity(self) -> None:
+    def test_emits_abandoned_when_pr_has_historical_activity(self) -> None:
         pr = self._make_tracked_stale_pr()
-        # A commit that predates the staleness window: the PR is genuinely stale
-        # (no recent activity) but has commits in its history, so a judge is needed
-        # rather than a simple abandoned verdict.
+        # A commit predating the staleness window: the PR is genuinely stale
+        # (no recent activity) but has commits in its history. The stale path
+        # always emits ABANDONED directly — the judge path requires closed_at
+        # and doesn't support open PRs.
         old_activity = PullRequestActivity.objects.create(
             pull_request=pr,
             event_type=PullRequestActivityType.SYNCHRONIZED,
@@ -291,13 +292,12 @@ class DetectStalePullRequestsTaskTest(TestCase):
         old_activity.save(update_fields=["date_added"])
         with (
             self.feature({"organizations:pr-metrics-activity": True}),
-            patch("sentry.pr_metrics.tasks.forward_to_judge") as mock_forward,
             patch("sentry.pr_metrics.tasks.emit_pr_metrics_row") as mock_emit,
         ):
+            mock_emit.return_value = True
             detect_stale_pull_requests_task()
 
-        mock_forward.assert_called_once_with(pr, self.organization)
-        mock_emit.assert_not_called()
+        mock_emit.assert_called_once()
 
     def test_skips_pr_without_emit_feature(self) -> None:
         self._make_tracked_stale_pr()
@@ -332,13 +332,9 @@ class DetectStalePullRequestsTaskTest(TestCase):
         # untouched one, so the task skips the org entirely rather than risking a
         # false abandoned verdict.
         self._make_tracked_stale_pr()
-        with (
-            patch("sentry.pr_metrics.tasks.forward_to_judge") as mock_forward,
-            patch("sentry.pr_metrics.tasks.emit_pr_metrics_row") as mock_emit,
-        ):
+        with patch("sentry.pr_metrics.tasks.emit_pr_metrics_row") as mock_emit:
             detect_stale_pull_requests_task()
 
-        mock_forward.assert_not_called()
         mock_emit.assert_not_called()
 
     def test_continues_when_org_not_found(self) -> None:

@@ -16,16 +16,13 @@ from sentry.models.pullrequest import (
     PullRequest,
     PullRequestActivity,
     PullRequestActivityType,
-    PullRequestAttribution,
     PullRequestMetrics,
     PullRequestVerdict,
 )
 from sentry.models.repository import Repository
-from sentry.pr_metrics.attribution import JUDGE_ELIGIBLE_SIGNAL_TYPES
-from sentry.pr_metrics.emit import emit_pr_metrics_row, select_verdict
+from sentry.pr_metrics.emit import emit_pr_metrics_row
 from sentry.pr_metrics.judge import forward_pr_to_seer_judge
 from sentry.pr_metrics.utils import _claim_terminal_event
-from sentry.seer.seer_setup import has_seer_access
 from sentry.silo.base import SiloMode
 from sentry.tasks.base import instrumented_task
 from sentry.taskworker.namespaces import seer_code_review_tasks
@@ -105,103 +102,6 @@ def cleanup_pr_activity_task(*, pull_request_id: int) -> None:
     metrics.incr("pr_metrics.cleanup_activity.deleted", amount=deleted)
 
 
-def _claim_for_judge(pr: PullRequest) -> bool:
-    """Claim a needs-judge terminal event for the forward path.
-
-    Like ``_claim_terminal_event`` but for the ``JUDGE_IN_PROGRESS`` sentinel, and
-    tolerant of a missing metrics row: ``select_verdict`` defers to a judge when
-    the row is absent, so ensure it exists before the compare-and-set claims the
-    sentinel onto a null verdict. Returns True if this call won the claim.
-    """
-    PullRequestMetrics.objects.get_or_create(pull_request=pr)
-    return _claim_terminal_event(pr, PullRequestVerdict.JUDGE_IN_PROGRESS)
-
-
-def forward_to_judge(pr: PullRequest, organization: Organization) -> None:
-    """Check conditions and forward a needs-judge terminal event to Seer if eligible.
-
-    Applies three eligibility gates in order before enqueuing:
-    * The org must have Seer access.
-    * The PR must have attribution in JUDGE_ELIGIBLE_SIGNAL_TYPES.
-    * The ``pr-metrics-judge`` feature flag must be enabled.
-
-    If all gates pass, claims the ``JUDGE_IN_PROGRESS`` sentinel (redelivery guard)
-    and enqueues ``forward_pr_to_seer_task``. On enqueue failure the sentinel is
-    released so a later redelivery can retry.
-    """
-    if not has_seer_access(organization):
-        metrics.incr("pr_metrics.emit.skipped", tags={"reason": "no_seer_access"})
-        logger.info(
-            "pr_metrics.emit.needs_judge",
-            extra={
-                "organization_id": organization.id,
-                "repository_id": pr.repository_id,
-                "pull_request_id": pr.id,
-                "reason": "no_seer_access",
-            },
-        )
-        return
-
-    if not PullRequestAttribution.objects.filter(
-        pull_request=pr,
-        is_valid=True,
-        signal_type__in=JUDGE_ELIGIBLE_SIGNAL_TYPES,
-    ).exists():
-        metrics.incr("pr_metrics.emit.skipped", tags={"reason": "no_eligible_attribution"})
-        logger.info(
-            "pr_metrics.emit.needs_judge",
-            extra={
-                "organization_id": organization.id,
-                "repository_id": pr.repository_id,
-                "pull_request_id": pr.id,
-                "reason": "not_agent_attribution",
-            },
-        )
-        return
-
-    if not features.has("organizations:pr-metrics-judge", organization):
-        metrics.incr("pr_metrics.emit.skipped", tags={"reason": "needs_judge"})
-        logger.info(
-            "pr_metrics.emit.needs_judge",
-            extra={
-                "organization_id": organization.id,
-                "repository_id": pr.repository_id,
-                "pull_request_id": pr.id,
-                "reason": "blocked_by_flag",
-            },
-        )
-        return
-
-    if not _claim_for_judge(pr):
-        metrics.incr("pr_metrics.emit.skipped", tags={"reason": "redelivery"})
-        return
-
-    try:
-        forward_pr_to_seer_task.delay(
-            pull_request_id=pr.id,
-            organization_id=organization.id,
-            repository_id=pr.repository_id,
-        )
-    except Exception:
-        # The claim committed but the enqueue didn't, so no task will settle this
-        # PR. Release the sentinel (only if it's still ours) so a webhook
-        # redelivery re-forwards rather than the PR sticking in JUDGE_IN_PROGRESS.
-        PullRequestMetrics.objects.filter(
-            pull_request=pr, verdict=PullRequestVerdict.JUDGE_IN_PROGRESS
-        ).update(verdict=None)
-        metrics.incr("pr_metrics.judge.enqueue_failed")
-        logger.exception(
-            "pr_metrics.judge.enqueue_failed",
-            extra={
-                "organization_id": organization.id,
-                "repository_id": pr.repository_id,
-                "pull_request_id": pr.id,
-            },
-        )
-        return
-    metrics.incr("pr_metrics.judge.enqueued")
-
-
 _STALE_BATCH_SIZE = 500
 STALENESS_WINDOW = timedelta(weeks=4)
 
@@ -263,12 +163,9 @@ def find_stale_pull_requests(*, cutoff: datetime) -> list[int]:
 def detect_stale_pull_requests_task() -> None:
     """Find and settle tracked PRs with no engaging activity since ``cutoff``.
 
-    For each candidate:
-    - If ``select_verdict`` says a judge is needed (the PR has commits or
-      discussion), it is forwarded to Seer via ``forward_to_judge``
-      — same path as a closed/merged PR that needs a conversation judgment.
-    - Otherwise (no engaging activity at all) it is claimed as ``abandoned`` and
-      emitted directly without a judge.
+    Each candidate is claimed as ``abandoned`` and emitted directly. The judge
+    path does not support open PRs (requires ``closed_at``), so all stale PRs
+    are settled here regardless of historical engagement.
 
     Each candidate is guarded by a compare-and-set claim before any action, so
     an overlapping run or redelivery won't double-process.
@@ -305,23 +202,16 @@ def detect_stale_pull_requests_task() -> None:
             if not features.has("organizations:pr-metrics-activity", org):
                 continue
 
-            # Ensure the metrics row exists before select_verdict reads it and
-            # before any compare-and-set claim. A stale PR may never have reached
-            # a close/merge webhook so the row may not exist yet.
+            # Ensure the metrics row exists before any compare-and-set claim.
+            # A stale PR may never have reached a close/merge webhook so the
+            # row may not exist yet.
             PullRequestMetrics.objects.get_or_create(pull_request=pr)
 
-            verdict = select_verdict(pr, org)
-            if verdict is None:
-                # PR has commits or discussion — delegate to the judge, same as
-                # a closed PR with engagement.
-                forward_to_judge(pr, org)
-            else:
-                # No engaging activity at all — emit as abandoned without a judge.
-                if not _claim_terminal_event(pr, PullRequestVerdict.ABANDONED):
-                    metrics.incr("pr_metrics.stale.skipped", tags={"reason": "already_claimed"})
-                    continue
-                if emit_pr_metrics_row(pull_request=pr):
-                    emitted += 1
+            if not _claim_terminal_event(pr, PullRequestVerdict.ABANDONED):
+                metrics.incr("pr_metrics.stale.skipped", tags={"reason": "already_claimed"})
+                continue
+            if emit_pr_metrics_row(pull_request=pr):
+                emitted += 1
 
     metrics.incr("pr_metrics.stale.emitted", amount=emitted)
     logger.info("pr_metrics.stale.emitted", extra={"count": emitted})
