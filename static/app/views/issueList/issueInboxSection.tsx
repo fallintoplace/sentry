@@ -63,6 +63,7 @@ export function IssueInboxSection({query, sort, onActionTaken}: IssueInboxSectio
   const organization = useOrganization();
   const {selection} = usePageFilters();
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [inboxActiveTab, setInboxActiveTab] = useState('activity');
   const [listWidth, setListWidth] = useSyncedLocalStorageState(
     'issue-inbox-list-width',
     DEFAULT_LIST_WIDTH
@@ -171,7 +172,11 @@ export function IssueInboxSection({query, sort, onActionTaken}: IssueInboxSectio
         />
         <InboxDetailPanel>
           {selectedGroupId ? (
-            <InboxDetail groupId={selectedGroupId} />
+            <InboxDetail
+              groupId={selectedGroupId}
+              activeTab={inboxActiveTab}
+              onTabChange={setInboxActiveTab}
+            />
           ) : (
             <Flex align="center" justify="center" style={{height: '100%'}}>
               <Text variant="muted">{t('Select an issue to view details')}</Text>
@@ -418,9 +423,11 @@ function InboxListItem({group, isSelected, onClick}: InboxListItemProps) {
 
 interface InboxDetailProps {
   groupId: string;
+  activeTab?: string;
+  onTabChange?: (tab: string) => void;
 }
 
-function InboxDetail({groupId}: InboxDetailProps) {
+function InboxDetail({groupId, activeTab, onTabChange}: InboxDetailProps) {
   const organization = useOrganization();
   const {data: group, isPending, isError} = useGroup({groupId});
   const {projects} = useProjects();
@@ -453,7 +460,11 @@ function InboxDetail({groupId}: InboxDetailProps) {
       <DetailBody>
         <GroupDataContextProvider group={group} project={project}>
           <ErrorBoundary mini>
-            <IssuePreviewContent fullWidthTabs />
+            <IssuePreviewContent
+              fullWidthTabs
+              activeTab={activeTab}
+              onTabChange={onTabChange}
+            />
           </ErrorBoundary>
         </GroupDataContextProvider>
       </DetailBody>
