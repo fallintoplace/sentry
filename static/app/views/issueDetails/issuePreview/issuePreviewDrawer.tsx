@@ -28,7 +28,7 @@ import {useHandleAssigneeChange} from 'sentry/components/group/assigneeSelector'
 import {useLinkedPullRequests} from 'sentry/components/group/externalIssuesList/linkedPullRequests';
 import {LoadingError} from 'sentry/components/loadingError';
 import {LoadingIndicator} from 'sentry/components/loadingIndicator';
-import {IconBug, IconOpen, IconUser} from 'sentry/icons';
+import {IconBug, IconChevron, IconOpen, IconUser} from 'sentry/icons';
 import {t} from 'sentry/locale';
 import {defined} from 'sentry/utils/defined';
 import type {Group} from 'sentry/types/group';
@@ -67,9 +67,19 @@ import {ExternalIssueSidebarList} from 'sentry/views/issueDetails/sidebar/extern
 
 interface IssuePreviewDrawerProps {
   groupId: string;
+  activeTab?: string;
+  onNavigateNext?: () => void;
+  onNavigatePrev?: () => void;
+  onTabChange?: (tab: string) => void;
 }
 
-export function IssuePreviewDrawer({groupId}: IssuePreviewDrawerProps) {
+export function IssuePreviewDrawer({
+  groupId,
+  onNavigatePrev,
+  onNavigateNext,
+  activeTab,
+  onTabChange,
+}: IssuePreviewDrawerProps) {
   const organization = useOrganization();
   const {data: group, isPending, isError} = useGroup({groupId});
   const {projects} = useProjects();
@@ -84,14 +94,29 @@ export function IssuePreviewDrawer({groupId}: IssuePreviewDrawerProps) {
       <DrawerHeader>
         <Flex justify="between" align="center" flex="1">
           {group && project && <IssueIdBreadcrumb group={group} project={project} />}
-          <LinkButton
-            to={issueDetailsUrl}
-            size="xs"
-            icon={<IconOpen />}
-            style={{marginLeft: 'auto'}}
-          >
-            {t('Open Issue')}
-          </LinkButton>
+          <Flex align="center" gap="xs" style={{marginLeft: 'auto'}}>
+            {(onNavigatePrev || onNavigateNext) && (
+              <Flex align="center">
+                <Button
+                  size="xs"
+                  icon={<IconChevron direction="up" />}
+                  aria-label={t('Previous issue')}
+                  disabled={!onNavigatePrev}
+                  onClick={onNavigatePrev}
+                />
+                <Button
+                  size="xs"
+                  icon={<IconChevron direction="down" />}
+                  aria-label={t('Next issue')}
+                  disabled={!onNavigateNext}
+                  onClick={onNavigateNext}
+                />
+              </Flex>
+            )}
+            <LinkButton to={issueDetailsUrl} size="xs" icon={<IconOpen />}>
+              {t('Open Issue')}
+            </LinkButton>
+          </Flex>
         </Flex>
       </DrawerHeader>
       <DrawerBody>
@@ -100,7 +125,7 @@ export function IssuePreviewDrawer({groupId}: IssuePreviewDrawerProps) {
         {group && project && (
           <GroupDataContextProvider group={group} project={project}>
             <ErrorBoundary mini>
-              <IssuePreviewContent />
+              <IssuePreviewContent activeTab={activeTab} onTabChange={onTabChange} />
             </ErrorBoundary>
           </GroupDataContextProvider>
         )}
@@ -116,13 +141,29 @@ interface IssuePreviewContentProps {
    * tabs can span full width (the parent must have no horizontal padding).
    */
   fullWidthTabs?: boolean;
+  /** Controlled tab key — lifted to the drawer so tab is preserved across issue navigation. */
+  activeTab?: string;
+  onTabChange?: (tab: string) => void;
 }
 
-export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
+export function IssuePreviewContent({
+  fullWidthTabs,
+  activeTab: activeTabProp,
+  onTabChange,
+}: IssuePreviewContentProps) {
   const {group, project} = useGroupData();
   const {hasAutofix} = useAiConfig(group, project);
-  const [activeTab, setActiveTab] = useState('activity');
-  const onActivateAutofixTab = useCallback(() => setActiveTab('autofix'), []);
+  const [activeTab, setActiveTabState] = useState(activeTabProp ?? 'activity');
+
+  const setActiveTab = useCallback(
+    (tab: string) => {
+      setActiveTabState(tab);
+      onTabChange?.(tab);
+    },
+    [onTabChange]
+  );
+
+  const onActivateAutofixTab = useCallback(() => setActiveTab('autofix'), [setActiveTab]);
 
   const {data: linkedPRsData} = useLinkedPullRequests({group});
   const openLinkedPR = linkedPRsData?.pullRequests.find(pr => pr.status === 'open');

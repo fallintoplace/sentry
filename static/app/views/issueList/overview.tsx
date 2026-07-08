@@ -154,7 +154,8 @@ function IssueListOverviewInner({
   const navigate = useNavigate();
   const {selection} = usePageFilters();
   const isPreviewMode = clickBehavior === 'preview';
-  const {openIssuePreview} = useIssuePreviewDrawer({enabled: isPreviewMode});
+  const [groupIds, setGroupIds] = useState<string[]>([]);
+  const {openIssuePreview} = useIssuePreviewDrawer({enabled: isPreviewMode, groupIds});
   const api = useApi();
   const urlParams = useParams<{viewId?: string}>();
   const realtimeActiveCookie = Cookies.get('realtimeActive');
@@ -163,7 +164,6 @@ function IssueListOverviewInner({
       ? false
       : realtimeActiveCookie === 'true'
   );
-  const [groupIds, setGroupIds] = useState<string[]>([]);
   const [pageLinks, setPageLinks] = useState('');
   const [queryCount, setQueryCount] = useState(0);
   const [queryMaxCount, setQueryMaxCount] = useState(0);

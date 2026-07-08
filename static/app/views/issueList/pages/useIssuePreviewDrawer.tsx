@@ -11,13 +11,22 @@ import {IssuePreviewDrawer} from 'sentry/views/issueDetails/issuePreview/issuePr
  * Query param holding the id of the issue whose preview drawer is open.
  * Presence opens the drawer; absence closes it.
  */
-const SELECTED_ISSUE_QUERY_PARAM = 'preview';
+export const SELECTED_ISSUE_QUERY_PARAM = 'preview';
+
+interface UseIssuePreviewDrawerOptions {
+  enabled?: boolean;
+  /** Ordered list of visible group IDs — used to compute prev/next navigation. */
+  groupIds?: string[];
+}
 
 /**
  * Opens a lightweight issue preview drawer.
  * The open/selected issue state is stored in the `preview` query param.
  */
-export function useIssuePreviewDrawer({enabled = true}: {enabled?: boolean} = {}) {
+export function useIssuePreviewDrawer({
+  enabled = true,
+  groupIds = [],
+}: UseIssuePreviewDrawerOptions = {}) {
   const {openDrawer} = useDrawer();
 
   const [selectedIssueId, setSelectedIssueId] = useQueryState(
@@ -32,6 +41,13 @@ export function useIssuePreviewDrawer({enabled = true}: {enabled?: boolean} = {}
     [setSelectedIssueId]
   );
 
+  // Keep a stable ref so the openDrawer render function always sees the latest list
+  const groupIdsRef = useRef(groupIds);
+  groupIdsRef.current = groupIds;
+
+  // Persist the active tab across issue navigations so switching issues doesn't reset it
+  const activeTabRef = useRef('activity');
+
   const lastOpenedIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -45,14 +61,35 @@ export function useIssuePreviewDrawer({enabled = true}: {enabled?: boolean} = {}
     }
 
     lastOpenedIdRef.current = selectedIssueId;
-    openDrawer(() => <IssuePreviewDrawer groupId={selectedIssueId} />, {
-      ariaLabel: t('Issue preview'),
-      drawerKey: 'issue-preview-drawer',
-      mode: 'passive',
-      shouldCloseOnLocationChange: nextLocation =>
-        !nextLocation.query[SELECTED_ISSUE_QUERY_PARAM],
-      onClose: () => setSelectedIssueId(null),
-    });
+
+    const currentIndex = groupIdsRef.current.indexOf(selectedIssueId);
+    const prevId = currentIndex > 0 ? groupIdsRef.current[currentIndex - 1] : undefined;
+    const nextId =
+      currentIndex < groupIdsRef.current.length - 1
+        ? groupIdsRef.current[currentIndex + 1]
+        : undefined;
+
+    openDrawer(
+      () => (
+        <IssuePreviewDrawer
+          groupId={selectedIssueId}
+          onNavigatePrev={prevId ? () => setSelectedIssueId(prevId) : undefined}
+          onNavigateNext={nextId ? () => setSelectedIssueId(nextId) : undefined}
+          activeTab={activeTabRef.current}
+          onTabChange={(tab: string) => {
+            activeTabRef.current = tab;
+          }}
+        />
+      ),
+      {
+        ariaLabel: t('Issue preview'),
+        drawerKey: 'issue-preview-drawer',
+        mode: 'passive',
+        shouldCloseOnLocationChange: nextLocation =>
+          !nextLocation.query[SELECTED_ISSUE_QUERY_PARAM],
+        onClose: () => setSelectedIssueId(null),
+      }
+    );
   }, [enabled, selectedIssueId, openDrawer, setSelectedIssueId]);
 
   return {openIssuePreview, selectedIssueId};

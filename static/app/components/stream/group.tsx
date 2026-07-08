@@ -53,6 +53,7 @@ import {hasDatasetSelector} from 'sentry/views/dashboards/utils';
 import {GroupPriority} from 'sentry/views/issueDetails/groupPriority';
 import {useAssignIssueMutation} from 'sentry/views/issueDetails/useAssignIssueMutation';
 import {COLUMN_BREAKPOINTS} from 'sentry/views/issueList/actions/utils';
+import {SELECTED_ISSUE_QUERY_PARAM} from 'sentry/views/issueList/pages/useIssuePreviewDrawer';
 import {
   useOptionalIssueSelectionActions,
   useOptionalIssueSelectionSummary,
@@ -210,7 +211,7 @@ export function LoadingStreamGroup({
   showLastTriggered = false,
 }: LoadingSteamGroupProps) {
   return (
-    <Wrapper data-test-id="group" useTintRow={false} reviewed={false}>
+    <Wrapper data-test-id="group" useTintRow={false} reviewed={false} isPreviewActive={false}>
       <GroupSummary canSelect={false}>
         <Placeholder height="58px" />
       </GroupSummary>
@@ -307,6 +308,7 @@ export function StreamGroup({
   const organization = useOrganization();
   const navigate = useNavigate();
   const location = useLocation();
+  const isPreviewActive = location.query[SELECTED_ISSUE_QUERY_PARAM] === groupId;
   const area = useAnalyticsArea();
   const selectionEnabled =
     canSelect && !!issueSelectionSummary && !!issueSelectionActions;
@@ -657,6 +659,7 @@ export function StreamGroup({
       onClick={onClick}
       reviewed={reviewed}
       useTintRow={useTintRow ?? true}
+      isPreviewActive={isPreviewActive}
     >
       <InteractionStateLayer />
       <Fragment>
@@ -806,6 +809,7 @@ const UnreadIndicator = styled('div')`
 
 // Position for wrapper is relative for overlay actions
 const Wrapper = styled(PanelItem)<{
+  isPreviewActive: boolean;
   reviewed: boolean;
   useTintRow: boolean;
 }>`
@@ -813,6 +817,7 @@ const Wrapper = styled(PanelItem)<{
   line-height: 1.1;
   padding: ${p => p.theme.space.md} 0;
   min-height: 82px;
+  ${p => p.isPreviewActive && `background-color: ${p.theme.tokens.background.secondary};`}
 
   &:not(:has(:hover)):not(:has(input:checked)):not(:focus-within) {
     ${CheckboxLabel} {
