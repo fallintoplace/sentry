@@ -7,7 +7,7 @@ import {Button, LinkButton} from '@sentry/scraps/button';
 import {DrawerBody, DrawerHeader} from '@sentry/scraps/drawer';
 import {Container, Flex} from '@sentry/scraps/layout';
 import {TabList, TabPanels, Tabs} from '@sentry/scraps/tabs';
-import {Heading} from '@sentry/scraps/text';
+import {Heading, Text} from '@sentry/scraps/text';
 import {Tooltip} from '@sentry/scraps/tooltip';
 
 import {AssigneeSelectorDropdown} from 'sentry/components/assigneeSelectorDropdown';
@@ -49,6 +49,11 @@ import {GroupPriority} from 'sentry/views/issueDetails/groupPriority';
 import {GroupStatusSubtitle} from 'sentry/views/issueDetails/header/groupStatusSubtitle';
 import {IssueIdBreadcrumb} from 'sentry/views/issueDetails/header/issueIdBreadcrumb';
 import {useAiConfig} from 'sentry/views/issueDetails/hooks/useAiConfig';
+import {useIssueProgress} from 'sentry/views/issueList/useIssueProgress';
+import {
+  formatProgressState,
+  getProgressIcon,
+} from 'sentry/views/issueList/utils/progress';
 import {IssuePreviewAutofix} from 'sentry/views/issueDetails/issuePreview/issuePreviewAutofix';
 import {IssuePreviewDetails} from 'sentry/views/issueDetails/issuePreview/issuePreviewDetails';
 import {EventList} from 'sentry/views/issueDetails/eventList';
@@ -126,6 +131,9 @@ export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
   const hasMergedPRPendingResolve =
     !!mergedLinkedPR && group.status !== GroupStatus.RESOLVED;
 
+  const {data: progressData} = useIssueProgress([group.id]);
+  const progressState = progressData?.results[group.id]?.progress ?? null;
+
   const {title: primaryTitle} = getTitle(group);
   const secondaryTitle = getMessage(group);
   const disableActions = [
@@ -142,24 +150,32 @@ export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
         borderBottom="muted"
       >
         <Flex direction="column" gap="xs">
-          <div>
-            <Tooltip
-              title={primaryTitle}
-              skipWrapper
-              isHoverable
-              showOnlyOnOverflow
-              delay={1000}
-            >
-              <Heading as="h3" size="lg" ellipsis>
-                {primaryTitle}
-              </Heading>
-            </Tooltip>
-            <EventMessage
-              level={group.level}
-              message={secondaryTitle}
-              type={group.type}
-            />
-          </div>
+          <Flex justify="between" align="start" gap="sm">
+            <Flex direction="column" flex="1" style={{minWidth: 0}}>
+              <Tooltip
+                title={primaryTitle}
+                skipWrapper
+                isHoverable
+                showOnlyOnOverflow
+                delay={1000}
+              >
+                <Heading as="h3" size="lg" ellipsis>
+                  {primaryTitle}
+                </Heading>
+              </Tooltip>
+              <EventMessage
+                level={group.level}
+                message={secondaryTitle}
+                type={group.type}
+              />
+            </Flex>
+            {progressState && (
+              <Flex align="center" gap="xs" style={{flexShrink: 0}}>
+                {getProgressIcon(progressState)}
+                <Text size="sm">{formatProgressState(progressState)}</Text>
+              </Flex>
+            )}
+          </Flex>
           <GroupStatusSubtitle group={group} project={project} />
         </Flex>
       </Container>
