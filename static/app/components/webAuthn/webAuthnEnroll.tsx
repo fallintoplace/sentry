@@ -2,9 +2,9 @@ import {useState} from 'react';
 import styled from '@emotion/styled';
 
 import {Button} from '@sentry/scraps/button';
+import {Stack} from '@sentry/scraps/layout';
+import {Text} from '@sentry/scraps/text';
 
-import {FormField} from 'sentry/components/forms/formField';
-import type {FormModel} from 'sentry/components/forms/model';
 import {t} from 'sentry/locale';
 import type {ChallengeData} from 'sentry/types/auth';
 
@@ -12,6 +12,12 @@ import {handleEnroll} from './handlers';
 
 interface WebAuthnEnrollProps {
   challengeData: ChallengeData;
+  /**
+   * Called with the enrollment result once the browser has produced a
+   * WebAuthn attestation. The `challenge` and `response` values are what the
+   * enrollment endpoint expects.
+   */
+  onEnroll: (result: {challenge: string; response: string}) => void;
 }
 
 const UNSUPPORTED_NOTICE = t(
@@ -20,52 +26,51 @@ const UNSUPPORTED_NOTICE = t(
 
 const FAILURE_MESSAGE = t('There was a problem enrolling, please try again.');
 
-export function WebAuthnEnroll({challengeData}: WebAuthnEnrollProps) {
+export function WebAuthnEnroll({challengeData, onEnroll}: WebAuthnEnrollProps) {
   const isSupported = !!window.PublicKeyCredential;
   const challenge = JSON.stringify(challengeData);
 
   const [activated, setActivated] = useState(false);
+  const [hasResponse, setHasResponse] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const triggerEnroll = async (model: FormModel) => {
+  const triggerEnroll = async () => {
     setActivated(false);
-    model.setError('challenge', false);
+    setError(null);
 
     try {
       const webAuthnResponse = await handleEnroll(challengeData);
 
       if (!webAuthnResponse) {
-        model.setError('challenge', FAILURE_MESSAGE);
+        setError(FAILURE_MESSAGE);
         return;
       }
 
       setActivated(true);
-      model.setValue('response', webAuthnResponse);
-      model.setValue('challenge', challenge);
+      setHasResponse(true);
+      onEnroll({challenge, response: webAuthnResponse});
     } catch (err) {
-      model.setError('challenge', FAILURE_MESSAGE);
+      setError(FAILURE_MESSAGE);
       setActivated(false);
     }
   };
 
   return (
-    <FormField
-      name="challenge"
-      label={t('Enroll Device')}
-      help={t('Enroll your Passkey, Security Key, or Biometric authenticator.')}
-      required
-      disabled={!isSupported}
-      disabledReason={UNSUPPORTED_NOTICE}
-      flexibleControlStateSize
-    >
-      {({model}) => (
-        <EnrollButton
-          onClick={() => triggerEnroll(model)}
-          disabled={!isSupported || activated}
-        >
-          {model.getValue('response') ? t('Enrolled!') : t('Start Enrollment')}
-        </EnrollButton>
+    <Stack gap="sm" align="start">
+      <EnrollButton onClick={triggerEnroll} disabled={!isSupported || activated}>
+        {hasResponse ? t('Enrolled!') : t('Start Enrollment')}
+      </EnrollButton>
+      {!isSupported && (
+        <Text variant="danger" size="sm">
+          {UNSUPPORTED_NOTICE}
+        </Text>
       )}
-    </FormField>
+      {error && (
+        <Text variant="danger" size="sm">
+          {error}
+        </Text>
+      )}
+    </Stack>
   );
 }
 
