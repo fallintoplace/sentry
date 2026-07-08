@@ -103,10 +103,7 @@ describe('Sudo Modal', () => {
     expect(sudoMock).not.toHaveBeenCalled();
 
     // "Sudo" auth
-    await userEvent.type(
-      await screen.findByRole('textbox', {name: 'Password'}),
-      'password'
-    );
+    await userEvent.type(await screen.findByLabelText('Password'), 'password');
     await userEvent.click(screen.getByRole('button', {name: 'Confirm Password'}));
 
     expect(sudoMock).toHaveBeenCalledWith(

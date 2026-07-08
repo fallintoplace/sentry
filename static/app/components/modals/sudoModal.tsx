@@ -1,10 +1,11 @@
-import {Fragment, useCallback, useState} from 'react';
+import {Fragment, useCallback, useRef, useState} from 'react';
 import styled from '@emotion/styled';
-import {useQuery} from '@tanstack/react-query';
+import {useMutation, useQuery} from '@tanstack/react-query';
 import trimEnd from 'lodash/trimEnd';
 
 import {Alert} from '@sentry/scraps/alert';
 import {Button, LinkButton} from '@sentry/scraps/button';
+import {defaultFormOptions, useScrapsForm} from '@sentry/scraps/form';
 import {Flex} from '@sentry/scraps/layout';
 
 import {logout} from 'sentry/actionCreators/account';
@@ -14,8 +15,6 @@ import {
   getBootstrapOrganizationQueryOptions,
   getBootstrapProjectsQueryOptions,
 } from 'sentry/bootstrap/bootstrapRequests';
-import {SecretField} from 'sentry/components/forms/fields/secretField';
-import {Form} from 'sentry/components/forms/form';
 import {LoadingIndicator} from 'sentry/components/loadingIndicator';
 import {Override} from 'sentry/components/override';
 import {WebAuthn} from 'sentry/components/webAuthn';
@@ -24,7 +23,7 @@ import {t} from 'sentry/locale';
 import {ConfigStore} from 'sentry/stores/configStore';
 import type {Authenticator} from 'sentry/types/auth';
 import {getApiUrl} from 'sentry/utils/api/getApiUrl';
-import {useApiQuery} from 'sentry/utils/queryClient';
+import {fetchMutation, useApiQuery} from 'sentry/utils/queryClient';
 import {useApi} from 'sentry/utils/useApi';
 import {useLocation} from 'sentry/utils/useLocation';
 import {useNavigate} from 'sentry/utils/useNavigate';
@@ -39,6 +38,15 @@ interface WebAuthnParams {
   superuserAccessCategory?: string;
   superuserReason?: string;
 }
+
+type AuthPayload = {
+  isSuperuserModal: boolean;
+  challenge?: string;
+  password?: string;
+  response?: string;
+  superuserAccessCategory?: string;
+  superuserReason?: string;
+};
 
 type DefaultProps = {
   closeButton?: boolean;
@@ -88,8 +96,7 @@ function SudoModal({
     superuserReason: '',
   });
 
-  const {error, errorType, showAccessForms, superuserAccessCategory, superuserReason} =
-    state;
+  const {error, errorType, showAccessForms} = state;
 
   const orgSlug = params.orgId ?? null;
   // We have to wait for these requests to finish before we can sudo, otherwise
@@ -125,6 +132,18 @@ function SudoModal({
     refetchOnWindowFocus: true,
   });
 
+  // Mirror mutable values into refs so the form's onSubmit callback always reads
+  // the current values instead of a stale render closure.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const authenticatorsRef = useRef(authenticators);
+  authenticatorsRef.current = authenticators;
+
+  const {mutateAsync: authenticate} = useMutation({
+    mutationFn: (data: AuthPayload) =>
+      fetchMutation({method: 'PUT', url: getApiUrl('/auth/'), data}),
+  });
+
   const handleSubmitCOPS = () => {
     setState(prevState => ({
       ...prevState,
@@ -150,35 +169,6 @@ function SudoModal({
       superuserAccessCategory: '',
       superuserReason: '',
     }));
-  };
-
-  const handleSubmit = async (data: any) => {
-    const disableU2FForSUForm = ConfigStore.get('disableU2FForSUForm');
-
-    const suAccessCategory = superuserAccessCategory || data.superuserAccessCategory;
-
-    const suReason = superuserReason || data.superuserReason;
-
-    if (!authenticators.length && !disableU2FForSUForm) {
-      handleError(ErrorCodes.NO_AUTHENTICATOR);
-      return;
-    }
-
-    if (showAccessForms && isSuperuser && !disableU2FForSUForm) {
-      setState(prevState => ({
-        ...prevState,
-        showAccessForms: false,
-        superuserAccessCategory: suAccessCategory,
-        superuserReason: suReason,
-      }));
-    } else {
-      try {
-        await api.requestPromise('/auth/', {method: 'PUT', data});
-        handleSuccess();
-      } catch (err) {
-        handleError(err);
-      }
-    }
   };
 
   const handleSuccess = useCallback(() => {
@@ -233,21 +223,92 @@ function SudoModal({
 
   const handleWebAuthn = useCallback(
     async (data: WebAuthnParams) => {
-      data.isSuperuserModal = isSuperuser;
-      data.superuserAccessCategory = state.superuserAccessCategory;
-      data.superuserReason = state.superuserReason;
       // It's ok to throw from here, u2fInterface will handle it.
-      await api.requestPromise('/auth/', {method: 'PUT', data});
+      await authenticate({
+        ...data,
+        isSuperuserModal: Boolean(isSuperuser),
+        superuserAccessCategory: stateRef.current.superuserAccessCategory,
+        superuserReason: stateRef.current.superuserReason,
+      });
       handleSuccess();
     },
-    [
-      api,
-      handleSuccess,
-      isSuperuser,
-      state.superuserAccessCategory,
-      state.superuserReason,
-    ]
+    [authenticate, handleSuccess, isSuperuser]
   );
+
+  const form = useScrapsForm({
+    ...defaultFormOptions,
+    defaultValues: {password: ''},
+    onSubmit: async ({value, formApi}) => {
+      const disableU2FForSUForm = ConfigStore.get('disableU2FForSUForm');
+      const isSelfHosted = ConfigStore.get('isSelfHosted');
+      const validateSUForm = ConfigStore.get('validateSUForm');
+      const currentAuthenticators = authenticatorsRef.current;
+
+      // Whether the superuser access form (categories + reason) is currently
+      // rendered — this mirrors the render-time branching in renderBodyContent.
+      const isSuperuserAccessForm =
+        Boolean(isSuperuser) &&
+        ((!user.hasPasswordAuth && currentAuthenticators.length === 0) ||
+          (!isSelfHosted && validateSUForm));
+
+      if (isSuperuserAccessForm) {
+        // The superuser access category / reason fields come from a getsentry
+        // override that renders legacy (unbound) form fields, so read their
+        // values directly from the DOM. COPS/CSM populates them via state first.
+        const formEl = document.getElementById(formApi.formId);
+        const formData = formEl instanceof HTMLFormElement ? new FormData(formEl) : null;
+        const domCategory = formData?.get('superuserAccessCategory');
+        const domReason = formData?.get('superuserReason');
+
+        const suAccessCategory =
+          stateRef.current.superuserAccessCategory ||
+          (typeof domCategory === 'string' ? domCategory : '');
+        const suReason =
+          stateRef.current.superuserReason ||
+          (typeof domReason === 'string' ? domReason : '');
+
+        if (!currentAuthenticators.length && !disableU2FForSUForm) {
+          handleError(ErrorCodes.NO_AUTHENTICATOR);
+          return;
+        }
+
+        if (stateRef.current.showAccessForms && !disableU2FForSUForm) {
+          setState(prevState => ({
+            ...prevState,
+            showAccessForms: false,
+            superuserAccessCategory: suAccessCategory,
+            superuserReason: suReason,
+          }));
+          return;
+        }
+
+        try {
+          await authenticate({
+            isSuperuserModal: true,
+            superuserAccessCategory: suAccessCategory,
+            superuserReason: suReason,
+          });
+          handleSuccess();
+        } catch (err) {
+          formApi.reset();
+          handleError(err);
+        }
+        return;
+      }
+
+      // Default (re-authenticate / password) flow.
+      try {
+        await authenticate({
+          isSuperuserModal: Boolean(isSuperuser),
+          password: value.password,
+        });
+        handleSuccess();
+      } catch (err) {
+        formApi.reset();
+        handleError(err);
+      }
+    },
+  });
 
   const getAuthLoginPath = (): string => {
     const authLoginPath = `/auth/login/?next=${encodeURIComponent(window.location.href)}`;
@@ -286,15 +347,18 @@ function SudoModal({
           </StyledTextBlock>
           {error && <Alert variant="danger">{errorType}</Alert>}
           {isSuperuser ? (
-            <Form
-              apiMethod="PUT"
-              apiEndpoint="/auth/"
-              submitLabel={showAccessForms ? t('Continue') : t('Re-authenticate')}
-              onSubmit={handleSubmit}
-              onSubmitSuccess={handleSuccess}
-              onSubmitError={handleError}
-              initialData={{isSuperuserModal: isSuperuser}}
-              extraButton={
+            <form.AppForm form={form}>
+              {!isSelfHosted && showAccessForms && (
+                <Override name="component:superuser-access-category" />
+              )}
+              {!isSelfHosted && !showAccessForms && (
+                <WebAuthn
+                  mode="sudo"
+                  authenticators={authenticators}
+                  onWebAuthn={handleWebAuthn}
+                />
+              )}
+              <FormFooter justify="between" align="center" gap="md">
                 <Flex align="center" margin="0 3xl">
                   {showAccessForms ? (
                     <Button type="submit" onClick={handleSubmitCOPS}>
@@ -306,20 +370,11 @@ function SudoModal({
                     </Button>
                   )}
                 </Flex>
-              }
-              resetOnError
-            >
-              {!isSelfHosted && showAccessForms && (
-                <Override name="component:superuser-access-category" />
-              )}
-              {!isSelfHosted && !showAccessForms && (
-                <WebAuthn
-                  mode="sudo"
-                  authenticators={authenticators}
-                  onWebAuthn={handleWebAuthn}
-                />
-              )}
-            </Form>
+                <form.SubmitButton>
+                  {showAccessForms ? t('Continue') : t('Re-authenticate')}
+                </form.SubmitButton>
+              </FormFooter>
+            </form.AppForm>
           ) : (
             <LinkButton variant="primary" href={getAuthLoginPath()}>
               {t('Continue')}
@@ -341,25 +396,20 @@ function SudoModal({
 
         {error && <Alert variant="danger">{errorType}</Alert>}
 
-        <Form
-          apiMethod="PUT"
-          apiEndpoint="/auth/"
-          submitLabel={t('Confirm Password')}
-          onSubmitSuccess={handleSuccess}
-          onSubmitError={handleError}
-          hideFooter={!user.hasPasswordAuth && authenticators.length === 0}
-          initialData={{isSuperuserModal: isSuperuser}}
-          resetOnError
-        >
+        <form.AppForm form={form}>
           {user.hasPasswordAuth && (
-            <SecretField
-              inline={false}
-              stacked
-              label={t('Password')}
-              name="password"
-              autoFocus
-              flexibleControlStateSize
-            />
+            <form.AppField name="password">
+              {field => (
+                <field.Layout.Stack label={t('Password')}>
+                  <field.Input
+                    type="password"
+                    autoFocus
+                    value={field.state.value}
+                    onChange={field.handleChange}
+                  />
+                </field.Layout.Stack>
+              )}
+            </form.AppField>
           )}
 
           <WebAuthn
@@ -367,7 +417,13 @@ function SudoModal({
             authenticators={authenticators}
             onWebAuthn={handleWebAuthn}
           />
-        </Form>
+
+          {!(!user.hasPasswordAuth && authenticators.length === 0) && (
+            <FormFooter justify="end">
+              <form.SubmitButton>{t('Confirm Password')}</form.SubmitButton>
+            </FormFooter>
+          )}
+        </form.AppForm>
       </Fragment>
     );
   };
@@ -386,4 +442,8 @@ export default SudoModal;
 
 const StyledTextBlock = styled(TextBlock)`
   margin-bottom: ${p => p.theme.space.md};
+`;
+
+const FormFooter = styled(Flex)`
+  margin-top: ${p => p.theme.space.xl};
 `;
