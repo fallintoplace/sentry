@@ -2,6 +2,9 @@ import {useEffect, useMemo, useRef, useState} from 'react';
 import styled from '@emotion/styled';
 import {useQuery} from '@tanstack/react-query';
 
+import type {CursorHandler} from '@sentry/scraps/pagination';
+import {getPaginationCaption, Pagination} from '@sentry/scraps/pagination';
+
 import {ActorAvatar} from '@sentry/scraps/avatar';
 import {LinkButton} from '@sentry/scraps/button';
 import {Checkbox} from '@sentry/scraps/checkbox';
@@ -21,7 +24,7 @@ import {IconOpen} from 'sentry/icons';
 import {t, tct} from 'sentry/locale';
 import {GroupStore} from 'sentry/stores/groupStore';
 import type {Group} from 'sentry/types/group';
-import {apiOptions} from 'sentry/utils/api/apiOptions';
+import {apiOptions, selectJsonWithHeaders} from 'sentry/utils/api/apiOptions';
 import {uniq} from 'sentry/utils/array/uniq';
 import {getMessage, getTitle} from 'sentry/utils/events';
 import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
@@ -64,25 +67,33 @@ export function IssueInboxSection({query, sort, onActionTaken}: IssueInboxSectio
     'issue-inbox-list-width',
     DEFAULT_LIST_WIDTH
   );
+  const [cursor, setCursor] = useState<string | undefined>(undefined);
+  const [pageIndex, setPageIndex] = useState(0);
   const layoutRef = useRef<HTMLDivElement>(null);
 
-  const {data: groups, isPending, isError, refetch} = useQuery(
-    apiOptions.as<Group[]>()('/organizations/$organizationIdOrSlug/issues/', {
+  const {data, isPending, isError, refetch} = useQuery({
+    ...apiOptions.as<Group[]>()('/organizations/$organizationIdOrSlug/issues/', {
       path: {organizationIdOrSlug: organization.slug},
       query: {
         query,
         sort,
+        cursor,
         project: selection.projects,
         environment: selection.environments,
         expand: ['inbox', 'owners'],
         limit: 25,
       },
       staleTime: 30_000,
-    })
-  );
+    }),
+    select: selectJsonWithHeaders,
+  });
+
+  const groups = useMemo(() => data?.json ?? [], [data]);
+  const pageLinks = data?.headers.Link;
+  const totalHits = data?.headers['X-Hits'];
 
   useEffect(() => {
-    if (groups && groups.length > 0) {
+    if (groups.length > 0) {
       GroupStore.add(groups);
       if (!selectedGroupId) {
         setSelectedGroupId(groups[0]!.id);
@@ -90,7 +101,7 @@ export function IssueInboxSection({query, sort, onActionTaken}: IssueInboxSectio
     }
   }, [groups, selectedGroupId]);
 
-  const groupIds = groups?.map(g => g.id) ?? [];
+  const groupIds = groups.map(g => g.id);
 
   function handleRefetch() {
     refetch();
@@ -131,11 +142,18 @@ export function IssueInboxSection({query, sort, onActionTaken}: IssueInboxSectio
             selection={selection}
             onDelete={handleRefetch}
             onActionTaken={handleRefetch}
+            pageLinks={pageLinks}
+            onCursor={(nextCursor, _path, _query, delta) => {
+              setCursor(nextCursor);
+              setPageIndex(p => p + delta);
+            }}
+            pageIndex={pageIndex}
+            totalHits={totalHits}
           />
           <InboxList>
             {isPending && <LoadingIndicator />}
             {isError && <LoadingError />}
-            {groups?.map(group => (
+            {groups.map(group => (
               <InboxListItem
                 key={group.id}
                 group={group}
@@ -168,9 +186,13 @@ export function IssueInboxSection({query, sort, onActionTaken}: IssueInboxSectio
 interface InboxActionsHeaderProps {
   groupIds: string[];
   onActionTaken: () => void;
+  onCursor: CursorHandler;
   onDelete: () => void;
   query: string;
   selection: ReturnType<typeof usePageFilters>['selection'];
+  pageIndex?: number;
+  pageLinks?: string;
+  totalHits?: number;
 }
 
 function InboxActionsHeader({
@@ -179,6 +201,10 @@ function InboxActionsHeader({
   selection,
   onDelete,
   onActionTaken,
+  pageLinks,
+  onCursor,
+  pageIndex = 0,
+  totalHits,
 }: InboxActionsHeaderProps) {
   const api = useApi();
   const organization = useOrganization();
@@ -287,6 +313,19 @@ function InboxActionsHeader({
             </SelectAllLink>
           )}
         </SelectAllInfo>
+      )}
+      {pageLinks && totalHits !== undefined && (
+        <InboxPagination
+          pageLinks={pageLinks}
+          onCursor={onCursor}
+          caption={getPaginationCaption({
+            cursor: `0:${pageIndex}:0`,
+            limit: 25,
+            pageLength: groupIds.length,
+            total: totalHits,
+          })}
+          size="xs"
+        />
       )}
     </ActionsBarContainer>
   );
@@ -472,10 +511,16 @@ const InboxList = styled('div')`
 `;
 
 const InboxDetailPanel = styled('div')`
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   background: ${p => p.theme.tokens.background.primary};
   display: flex;
   flex-direction: column;
+`;
+
+const InboxPagination = styled(Pagination)`
+  margin: 0 0 0 auto;
 `;
 
 const ActionsBarContainer = styled('div')`

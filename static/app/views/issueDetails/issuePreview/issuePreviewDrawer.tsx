@@ -1,4 +1,4 @@
-import {Fragment} from 'react';
+import {Fragment, useCallback, useMemo, useState} from 'react';
 import {css} from '@emotion/react';
 import styled from '@emotion/styled';
 
@@ -14,18 +14,30 @@ import {AssigneeSelectorDropdown} from 'sentry/components/assigneeSelectorDropdo
 import {IconCellSignal} from 'sentry/components/badge/iconCellSignal';
 import {ErrorBoundary} from 'sentry/components/errorBoundary';
 import {EventMessage} from 'sentry/components/events/eventMessage';
+import {
+  getAutofixArtifactFromSection,
+  getOrderedAutofixSections,
+  isCodeChangesSection,
+  isPullRequestsArtifact,
+  isPullRequestsSection,
+  isRootCauseSection,
+  isSolutionSection,
+  useExplorerAutofix,
+} from 'sentry/components/events/autofix/useExplorerAutofix';
 import {useHandleAssigneeChange} from 'sentry/components/group/assigneeSelector';
+import {useLinkedPullRequests} from 'sentry/components/group/externalIssuesList/linkedPullRequests';
 import {LoadingError} from 'sentry/components/loadingError';
 import {LoadingIndicator} from 'sentry/components/loadingIndicator';
-import {IconOpen, IconUser} from 'sentry/icons';
+import {IconBug, IconOpen, IconUser} from 'sentry/icons';
 import {t} from 'sentry/locale';
+import {defined} from 'sentry/utils/defined';
 import type {Group} from 'sentry/types/group';
-import {PriorityLevel} from 'sentry/types/group';
+import {GroupStatus, PriorityLevel} from 'sentry/types/group';
+import type {LinkedPullRequest} from 'sentry/types/integrations';
 import {getMessage, getTitle} from 'sentry/utils/events';
 import {normalizeUrl} from 'sentry/utils/url/normalizeUrl';
 import {useOrganization} from 'sentry/utils/useOrganization';
 import {useProjects} from 'sentry/utils/useProjects';
-import {useSyncedLocalStorageState} from 'sentry/utils/useSyncedLocalStorageState';
 import {GroupActions} from 'sentry/views/issueDetails/actions/index';
 import {ActivitySection} from 'sentry/views/issueDetails/activitySection';
 import {IssueDetailsContextProvider} from 'sentry/views/issueDetails/context';
@@ -41,10 +53,12 @@ import {IssuePreviewAutofix} from 'sentry/views/issueDetails/issuePreview/issueP
 import {IssuePreviewDetails} from 'sentry/views/issueDetails/issuePreview/issuePreviewDetails';
 import {EventList} from 'sentry/views/issueDetails/eventList';
 import {useGroup} from 'sentry/views/issueDetails/useGroup';
+import {useGroupEvent} from 'sentry/views/issueDetails/useGroupEvent';
 import {
   getGroupReprocessingStatus,
   ReprocessingStatus,
 } from 'sentry/views/issueDetails/utils';
+import {ExternalIssueSidebarList} from 'sentry/views/issueDetails/sidebar/externalIssueSidebarList';
 
 interface IssuePreviewDrawerProps {
   groupId: string;
@@ -90,7 +104,6 @@ export function IssuePreviewDrawer({groupId}: IssuePreviewDrawerProps) {
   );
 }
 
-const INBOX_TAB_KEY = 'issue-inbox-selected-tab';
 
 interface IssuePreviewContentProps {
   /**
@@ -103,7 +116,15 @@ interface IssuePreviewContentProps {
 export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
   const {group, project} = useGroupData();
   const {hasAutofix} = useAiConfig(group, project);
-  const [activeTab, setActiveTab] = useSyncedLocalStorageState(INBOX_TAB_KEY, 'activity');
+  const [activeTab, setActiveTab] = useState('activity');
+  const onActivateAutofixTab = useCallback(() => setActiveTab('autofix'), []);
+
+  const {data: linkedPRsData} = useLinkedPullRequests({group});
+  const openLinkedPR = linkedPRsData?.pullRequests.find(pr => pr.status === 'open');
+  const mergedLinkedPR = linkedPRsData?.pullRequests.find(pr => pr.status === 'merged');
+  // If there's a merged PR and the issue isn't yet resolved, Resolve becomes primary
+  const hasMergedPRPendingResolve =
+    !!mergedLinkedPR && group.status !== GroupStatus.RESOLVED;
 
   const {title: primaryTitle} = getTitle(group);
   const secondaryTitle = getMessage(group);
@@ -151,16 +172,24 @@ export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
         gap="sm"
         fullWidthTabs={fullWidthTabs}
       >
+        {hasAutofix && !hasMergedPRPendingResolve && (
+          <InboxAutofixCta
+            group={group}
+            onActivateAutofixTab={onActivateAutofixTab}
+            linkedOpenPR={openLinkedPR}
+          />
+        )}
         <GroupActions
           group={group}
           project={project}
           disabled={disableActions}
           event={null}
+          actionsAreSecondary={hasAutofix && !hasMergedPRPendingResolve}
         />
         <InboxPriorityButton group={group} />
         <InboxAssigneeButton group={group} />
       </ActionBarFlex>
-      <Tabs value={activeTab} onChange={setActiveTab}>
+      <InboxTabs value={activeTab} onChange={setActiveTab}>
         <Container paddingTop="md" paddingBottom="md" paddingLeft="lg" paddingRight="lg" borderBottom="muted">
           <TabList variant="floating">
             <TabList.Item key="activity">{t('Activity')}</TabList.Item>
@@ -173,13 +202,23 @@ export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
         </Container>
         <TabPanels>
           <TabPanels.Item key="activity">
-            <Container paddingTop="md" paddingLeft="lg" paddingRight="lg">
-              <ActivitySection
-                group={group}
-                variant="standalone"
-                size="md"
-                placeholder={t('Add a comment. Tag users with @, or teams with #')}
-              />
+            {/* Own container so SectionDivider (hr) that FoldSection always appends
+                becomes the last child → auto-hidden by its &:last-child rule */}
+            <ExternalLinksContainer paddingTop="md" paddingLeft="lg" paddingRight="lg">
+              <InboxExternalLinks group={group} />
+            </ExternalLinksContainer>
+            <Container paddingTop="2xl" paddingLeft="lg" paddingRight="lg">
+              <Container paddingBottom="md">
+                <Heading as="h3" size="md">{t('Activity Feed')}</Heading>
+              </Container>
+              <Container paddingLeft="xl">
+                <ActivitySection
+                  group={group}
+                  variant="standalone"
+                  size="md"
+                  placeholder={t('Add a comment. Tag users with @, or teams with #')}
+                />
+              </Container>
             </Container>
           </TabPanels.Item>
           {hasAutofix ? (
@@ -202,9 +241,200 @@ export function IssuePreviewContent({fullWidthTabs}: IssuePreviewContentProps) {
             </Container>
           </TabPanels.Item>
         </TabPanels>
-      </Tabs>
+      </InboxTabs>
     </Fragment>
   );
+}
+
+interface InboxAutofixCtaProps {
+  group: Group;
+  onActivateAutofixTab: () => void;
+  linkedOpenPR?: LinkedPullRequest;
+}
+
+function InboxAutofixCta({
+  group,
+  onActivateAutofixTab,
+  linkedOpenPR,
+}: InboxAutofixCtaProps) {
+  const autofix = useExplorerAutofix(group.id);
+
+  const sections = useMemo(
+    () => getOrderedAutofixSections(autofix.runState),
+    [autofix.runState]
+  );
+
+  const runId = autofix.runState?.run_id;
+  const lastSection = sections[sections.length - 1];
+
+  // A linked open PR (from GitHub integration) always wins — show View PR first
+  if (linkedOpenPR) {
+    return (
+      <LinkButton
+        size="sm"
+        variant="primary"
+        href={linkedOpenPR.externalUrl}
+        external
+        openInNewTab
+        icon={<IconOpen />}
+      >
+        {t('View PR')}
+      </LinkButton>
+    );
+  }
+
+  if (autofix.isLoading) {
+    return null;
+  }
+
+  // Fallback: autofix run state may have created a PR not yet reflected in linked PRs
+  const completedPR = Object.values(autofix.runState?.repo_pr_states ?? {}).find(
+    pr => pr.pr_creation_status === 'completed' && pr.pr_url
+  );
+  if (completedPR) {
+    return (
+      <LinkButton
+        size="sm"
+        variant="primary"
+        href={completedPR.pr_url!}
+        external
+        openInNewTab
+        icon={<IconOpen />}
+      >
+        {t('View PR')}
+      </LinkButton>
+    );
+  }
+
+  if (!sections.length) {
+    return (
+      <Button
+        size="sm"
+        variant="primary"
+        icon={<IconBug />}
+        onClick={() => {
+          onActivateAutofixTab();
+          autofix.startStep('root_cause');
+        }}
+      >
+        {t('Start Analysis')}
+      </Button>
+    );
+  }
+
+  if (autofix.isPolling) {
+    return (
+      <Button
+        size="sm"
+        variant="primary"
+        icon={<LoadingIndicator size={14} mini />}
+        onClick={onActivateAutofixTab}
+      >
+        {t('Analyzing…')}
+      </Button>
+    );
+  }
+
+  if (lastSection?.status !== 'completed') {
+    return null;
+  }
+
+  const artifact = getAutofixArtifactFromSection(lastSection);
+
+  if (isRootCauseSection(lastSection) && artifact) {
+    return (
+      <Button
+        size="sm"
+        variant="primary"
+        onClick={() => {
+          onActivateAutofixTab();
+          autofix.startStep('solution', {runId});
+        }}
+      >
+        {t('Make a Plan')}
+      </Button>
+    );
+  }
+
+  if (isSolutionSection(lastSection) && artifact) {
+    return (
+      <Button
+        size="sm"
+        variant="primary"
+        onClick={() => {
+          onActivateAutofixTab();
+          autofix.startStep('code_changes', {runId});
+        }}
+      >
+        {t('Write a Code Fix')}
+      </Button>
+    );
+  }
+
+  if (isCodeChangesSection(lastSection) && artifact && defined(runId)) {
+    return (
+      <Button
+        size="sm"
+        variant="primary"
+        onClick={() => {
+          onActivateAutofixTab();
+          autofix.createPR(runId);
+        }}
+      >
+        {t('Draft a PR')}
+      </Button>
+    );
+  }
+
+  if (isPullRequestsSection(lastSection)) {
+    const prArtifact = getAutofixArtifactFromSection(lastSection);
+    if (isPullRequestsArtifact(prArtifact)) {
+      const completedPR = prArtifact.find(
+        pr => pr.pr_creation_status === 'completed' && pr.pr_url
+      );
+      if (completedPR) {
+        return (
+          <LinkButton
+            size="sm"
+            variant="primary"
+            href={completedPR.pr_url!}
+            external
+            openInNewTab
+            icon={<IconOpen />}
+          >
+            {t('View PR')}
+          </LinkButton>
+        );
+      }
+    }
+    return (
+      <Button size="sm" variant="primary" disabled>
+        {t('View PR')}
+      </Button>
+    );
+  }
+
+  return null;
+}
+
+// Force tab panels to fill full width. TabPanelWrap in horizontal orientation
+// sets height:100% but omits width, which can leave panels narrower than the container.
+const InboxTabs = styled(Tabs)`
+  & [role='tabpanel'] {
+    width: 100%;
+  }
+` as typeof Tabs;
+
+const ExternalLinksContainer = styled(Container)`
+  overflow: hidden;
+`;
+
+function InboxExternalLinks({group}: {group: Group}) {
+  const {data: event} = useGroupEvent({groupId: group.id, eventId: 'latest'});
+  if (!event) {
+    return null;
+  }
+  return <ExternalIssueSidebarList group={group} event={event} />;
 }
 
 const ActionBarFlex = styled(Flex)<{fullWidthTabs?: boolean}>`

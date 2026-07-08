@@ -2,7 +2,7 @@ import {Fragment, useCallback} from 'react';
 
 import {Button} from '@sentry/scraps/button';
 
-import {ArchiveActions} from 'sentry/components/actions/archive';
+import {getArchiveActions} from 'sentry/components/actions/archive';
 import {useAnalyticsArea} from 'sentry/components/analyticsArea';
 import {makeGroupPriorityDropdownOptions} from 'sentry/components/badge/groupPriority';
 import {openConfirmModal} from 'sentry/components/confirm';
@@ -166,7 +166,48 @@ export function ActionSet({
     });
   };
 
+  const archiveMenuItems = getArchiveActions({
+    onUpdate: handleUpdate,
+    shouldConfirm: onShouldConfirm(ConfirmAction.ARCHIVE),
+    confirmMessage: () => confirm({action: ConfirmAction.ARCHIVE, canBeUndone: true}),
+    confirmLabel: label('archive'),
+  }).dropdownItems;
+
+  const priorityMenuItems = makeGroupPriorityDropdownOptions({
+    onChange: priority => {
+      openConfirmModal({
+        bypass: !onShouldConfirm(ConfirmAction.SET_PRIORITY),
+        onConfirm: () => handleUpdate({priority}),
+        message: confirm({
+          action: ConfirmAction.SET_PRIORITY,
+          append: ` to ${priority}`,
+          canBeUndone: true,
+        }),
+        confirmText: label('reprioritize'),
+      });
+    },
+  });
+
   const menuItems: MenuItemProps[] = [
+    {
+      key: 'archive',
+      label: t('Archive'),
+      disabled: ignoreDisabled,
+      children: archiveMenuItems,
+    },
+    {
+      key: 'merge',
+      label: t('Merge'),
+      disabled: mergeDisabled,
+      details: makeMergeTooltip() || undefined,
+      onAction: handleMergeClick,
+    },
+    {
+      key: 'set-priority',
+      label: t('Set Priority'),
+      disabled: !anySelected,
+      children: priorityMenuItems,
+    },
     {
       key: 'mark-reviewed',
       label: t('Mark Reviewed'),
@@ -262,39 +303,6 @@ export function ActionSet({
         confirm={confirm}
         label={label}
         selectedProjectSlug={selectedProjectSlug}
-      />
-      <ArchiveActions
-        onUpdate={handleUpdate}
-        shouldConfirm={onShouldConfirm(ConfirmAction.ARCHIVE)}
-        confirmMessage={() => confirm({action: ConfirmAction.ARCHIVE, canBeUndone: true})}
-        confirmLabel={label('archive')}
-        disabled={ignoreDisabled}
-      />
-      <Button
-        size="xs"
-        onClick={handleMergeClick}
-        disabled={mergeDisabled}
-        tooltipProps={{title: makeMergeTooltip()}}
-      >
-        {t('Merge')}
-      </Button>
-      <DropdownMenu
-        triggerLabel={t('Set Priority')}
-        size="xs"
-        items={makeGroupPriorityDropdownOptions({
-          onChange: priority => {
-            openConfirmModal({
-              bypass: !onShouldConfirm(ConfirmAction.SET_PRIORITY),
-              onConfirm: () => handleUpdate({priority}),
-              message: confirm({
-                action: ConfirmAction.SET_PRIORITY,
-                append: ` to ${priority}`,
-                canBeUndone: true,
-              }),
-              confirmText: label('reprioritize'),
-            });
-          },
-        })}
       />
       {!nestReview && (
         <ReviewAction disabled={!canMarkReviewed} onUpdate={handleUpdate} />

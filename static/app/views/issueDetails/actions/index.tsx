@@ -18,7 +18,7 @@ import type {ModalRenderProps} from 'sentry/actionCreators/modal';
 import {openReprocessEventModal} from 'sentry/actionCreators/modal';
 import Feature from 'sentry/components/acl/feature';
 import {FeatureDisabled} from 'sentry/components/acl/featureDisabled';
-import {ArchiveActions} from 'sentry/components/actions/archive';
+import {ArchiveActions, getArchiveActions} from 'sentry/components/actions/archive';
 import {ResolveActions} from 'sentry/components/actions/resolve';
 import {renderArchiveReason} from 'sentry/components/archivedBox';
 import {CMDKAction} from 'sentry/components/commandPalette/ui/cmdk';
@@ -104,9 +104,14 @@ interface GroupActionsProps {
   event: Event | null;
   group: Group;
   project: Project;
+  /**
+   * When true, resolve/archive buttons render with secondary styling so a
+   * higher-priority CTA (e.g. the autofix button) can hold the primary slot.
+   */
+  actionsAreSecondary?: boolean;
 }
 
-export function GroupActions({group, project, disabled, event}: GroupActionsProps) {
+export function GroupActions({group, project, disabled, event, actionsAreSecondary}: GroupActionsProps) {
   const {openModal} = useModal();
 
   const theme = useTheme();
@@ -550,36 +555,42 @@ export function GroupActions({group, project, disabled, event}: GroupActionsProp
                 isResolved={isResolved}
                 isAutoResolved={isAutoResolved}
                 size="sm"
-                priority="primary"
+                priority={actionsAreSecondary ? undefined : 'primary'}
               />
             )}
-            <ArchiveActions
-              size="sm"
-              isArchived={isIgnored}
-              onUpdate={onUpdate}
-              disabled={disabled}
-              disableArchiveUntilOccurrence={!archiveUntilOccurrenceCap.enabled}
-            />
+            {!actionsAreSecondary && (
+              <ArchiveActions
+                size="sm"
+                isArchived={isIgnored}
+                onUpdate={onUpdate}
+                disabled={disabled}
+                disableArchiveUntilOccurrence={!archiveUntilOccurrenceCap.enabled}
+              />
+            )}
           </Fragment>
         )}
-        <SubscribeAction
-          disabled={disabled}
-          disablePriority
-          group={group}
-          onClick={handleClick(onToggleSubscribe)}
-          icon={group.isSubscribed ? <IconSubscribed /> : <IconUnsubscribed />}
-          size="sm"
-        />
-        <Button
-          size="sm"
-          onClick={openShareModal}
-          icon={<IconUpload />}
-          aria-label={t('Share')}
-          tooltipProps={{title: t('Share Issue')}}
-          disabled={disabled}
-          analyticsEventKey="issue_details.share_action_clicked"
-          analyticsEventName="Issue Details: Share Action Clicked"
-        />
+        {!actionsAreSecondary && (
+          <SubscribeAction
+            disabled={disabled}
+            disablePriority
+            group={group}
+            onClick={handleClick(onToggleSubscribe)}
+            icon={group.isSubscribed ? <IconSubscribed /> : <IconUnsubscribed />}
+            size="sm"
+          />
+        )}
+        {!actionsAreSecondary && (
+          <Button
+            size="sm"
+            onClick={openShareModal}
+            icon={<IconUpload />}
+            aria-label={t('Share')}
+            tooltipProps={{title: t('Share Issue')}}
+            disabled={disabled}
+            analyticsEventKey="issue_details.share_action_clicked"
+            analyticsEventName="Issue Details: Share Action Clicked"
+          />
+        )}
         <DropdownMenu
           triggerProps={{
             'aria-label': t('More Actions'),
@@ -588,6 +599,42 @@ export function GroupActions({group, project, disabled, event}: GroupActionsProp
             size: 'sm',
           }}
           items={[
+            {
+              key: 'archive',
+              label: t('Archive'),
+              hidden: !actionsAreSecondary || isResolved || isIgnored,
+              disabled,
+              children: getArchiveActions({
+                onUpdate,
+                disableArchiveUntilOccurrence: !archiveUntilOccurrenceCap.enabled,
+              }).dropdownItems,
+            },
+            {
+              key: 'unarchive',
+              label: t('Unarchive'),
+              hidden: !actionsAreSecondary || !isIgnored,
+              disabled,
+              onAction: () =>
+                onUpdate({
+                  status: GroupStatus.UNRESOLVED,
+                  statusDetails: {},
+                  substatus: GroupSubstatus.ONGOING,
+                }),
+            },
+            {
+              key: 'subscribe',
+              label: group.isSubscribed ? t('Unsubscribe') : t('Subscribe'),
+              hidden: !actionsAreSecondary,
+              disabled,
+              onAction: () => onToggleSubscribe(),
+            },
+            {
+              key: 'share',
+              label: t('Share'),
+              hidden: !actionsAreSecondary,
+              disabled: disabled || !shareCap.enabled,
+              onAction: openShareModal,
+            },
             {
               key: 'mark-review',
               label: t('Mark reviewed'),
