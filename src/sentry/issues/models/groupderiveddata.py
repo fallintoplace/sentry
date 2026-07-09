@@ -28,60 +28,22 @@ class GroupDerivedData(DefaultFieldsModel):
     at any time (enforced by a partial unique constraint). Only the live row is
     considered canonical; non-live rows are transient build artifacts.
 
-    Lifecycle
-    ---------
-
-    **On-demand creation (development / early rollout)**
-
-        When the ``issues.derived-data.create-on-demand`` option is enabled,
-        the first call to process derived data for a group creates a live row
-        and incrementally applies log entries as they arrive. This is the
-        simplest path and useful when the action log is known to be complete.
-
-    **Backfill-then-activate (production rollout)**
-
-        When the option is disabled, processing is a no-op for groups that have
-        no live row yet. Instead, a background task:
-
-        1. Backfills historical Activity records into the action log.
-        2. Creates a new *non-live* GroupDerivedData row (``is_live=False``).
-        3. Drains the entire action log for that group into the new row.
-        4. Atomically promotes the row to ``is_live=True``, replacing any
-           existing live row.
-
-        This ensures derived data is only visible once it reflects the full
-        history.
-
-    **Re-derivation after log mutations**
-
-        When the action log is mutated (entries inserted, corrected, or
-        reordered), the existing live row may be stale. Two strategies:
-
-        - *Hard delete*: delete the live row and rebuild from scratch. Use
-          this when the existing data is known to be wrong.
-        - *Soft replacement*: leave the current live row in place, build a
-          new non-live row from scratch, and promote it once caught up. This
-          avoids a window where no derived data is available.
-
-    Versioning and promotion safety
-    -------------------------------
-
-    The auto-increment ``id`` serves as a coarse version: a row created later
-    always has a higher id. ``promote_to_live`` enforces two invariants:
-
-    1. A candidate's id must be greater than the current live row's id, so an
-       older build cannot replace a newer one.
-    2. A candidate's cursor must be at or ahead of the current live row's
-       cursor, so promotion never regresses history coverage.
-
-    If two background builds race, the one with the lower id loses. The loser
-    is cleaned up by the caller or by periodic stale-row cleanup.
+    See ``DERIVED_DATA.md`` in the repository root for the full lifecycle,
+    versioning, and promotion protocol.
     """
 
     __relocation_scope__ = RelocationScope.Excluded
 
     group = FlexibleForeignKey("sentry.Group")
     is_live = models.BooleanField(default=False)
+
+    # Monotonically increasing value reflecting how complete this row's view
+    # of the action log is. A higher version means the build observed a more
+    # complete log. Used in promotion to ensure a build that missed log
+    # mutations cannot replace one that saw them. Currently populated from
+    # max(GroupActionLogEntry.id) for the group at processing start time.
+    version = BoundedBigIntegerField(default=0)
+
     cursor_date = models.DateTimeField(default=EPOCH)
     cursor_id = BoundedBigIntegerField(default=0)
 
@@ -129,4 +91,4 @@ class GroupDerivedData(DefaultFieldsModel):
             ),
         ]
 
-    __repr__ = sane_repr("group_id", "is_live", "cursor_date", "cursor_id")
+    __repr__ = sane_repr("group_id", "is_live", "version", "cursor_date", "cursor_id")

@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError, router, transaction
-from django.db.models import Q
+from django.db.models import Max, Q
 
 from sentry import options
 from sentry.issues.derived.aggregators import AGGREGATORS
@@ -17,6 +17,10 @@ from sentry.utils import metrics
 
 logger = logging.getLogger(__name__)
 
+# Pipeline with current aggregators. Versioned because in principle
+# we may want to change it in place and correlate that to existing derived data
+# for invalidation purposes.
+# TODO: Shouldn't it be versioned by a feature set hash? To be sorted out later.
 PIPELINE: Pipeline[GroupActionLogEntry] = Pipeline(AGGREGATORS, version=1)
 
 DEFAULT_BATCH_SIZE = 1000
@@ -24,9 +28,9 @@ INLINE_BATCH_SIZE = 100
 
 
 class ProcessingStrategy(enum.Enum):
-    SYNC = "sync"
-    ASYNC = "async"
-    INLINE = "inline"
+    SYNC = "sync"  # process all pending actions now
+    ASYNC = "async"  # schedule a task to process all pending actions
+    INLINE = "inline"  # try to process all pending actions quickly; fall back to ASYNC
 
 
 def _ensure_derived(group_id: int) -> GroupDerivedData | None:
@@ -89,6 +93,10 @@ def _process_batch(
        past our batch. If it fails (updated == 0), a concurrent caller
        already wrote a superset of our work, so we refresh and check if
        more remains.
+
+    This is an optimistic concurrency scheme — no locks are held, and the
+    last-writer-wins semantics are safe because all writers compute the
+    same deterministic result for overlapping entry ranges.
     """
     group_id = derived.group_id
     entries = _entries_after_cursor(group_id, derived.cursor_date, derived.cursor_id, batch_size)
@@ -109,6 +117,7 @@ def _process_batch(
     ).update(cursor_date=last_date, cursor_id=last_id, **state_update)
 
     if updated:
+        # Features updated in this batch (not total; a feature appears at most once per batch)
         for f in result.updated:
             metrics.incr(
                 "issues.derived.feature_updated", sample_rate=1.0, tags={"feature": f.name}
@@ -139,6 +148,9 @@ def _process_batch(
                 "db_cursor_id": derived.cursor_id,
             },
         )
+        # A concurrent caller advanced the cursor past us. Check whether
+        # there are still entries beyond the refreshed cursor so we don't
+        # silently stop processing.
         return bool(_entries_after_cursor(group_id, derived.cursor_date, derived.cursor_id, 1))
 
 
@@ -182,6 +194,11 @@ def trigger_group_log_processing(group_id: int, *, strategy: ProcessingStrategy)
     """Trigger derived data processing for a group.
 
     Silently returns if the group has been deleted or no live row exists.
+
+    Strategy controls how processing is dispatched:
+      SYNC   — process all pending actions now
+      ASYNC  — schedule a task to process all pending actions
+      INLINE — try to process all pending actions quickly; fall back to ASYNC
     """
     from sentry.issues.derived.tasks import process_group_log_task
 
@@ -210,6 +227,8 @@ def trigger_group_log_processing(group_id: int, *, strategy: ProcessingStrategy)
 
         has_more = _process_batch(PIPELINE, derived, INLINE_BATCH_SIZE)
     if has_more:
+        # Derived data will be stale for any code running between now and
+        # when the task completes.
         metrics.incr("issues.derived.inline_fallback_to_async")
         process_group_log_task.delay(group_id)
 
@@ -219,15 +238,24 @@ def trigger_group_log_processing(group_id: int, *, strategy: ProcessingStrategy)
 # ---------------------------------------------------------------------------
 
 
+def _max_entry_id(group_id: int) -> int:
+    return (
+        GroupActionLogEntry.objects.filter(group_id=group_id).aggregate(max_id=Max("id"))["max_id"]
+        or 0
+    )
+
+
 def create_processing_row(group_id: int) -> GroupDerivedData:
     """Create a new non-live GroupDerivedData row for background processing.
 
-    The auto-increment id serves as a version — rows created later have higher
-    ids and take precedence during promotion.
+    The version is set to the current max GroupActionLogEntry id for the group,
+    capturing the log state at the time processing starts.
     """
+    version = _max_entry_id(group_id)
     return GroupDerivedData.objects.create(
         group_id=group_id,
         is_live=False,
+        version=version,
         cursor_date=EPOCH,
         cursor_id=0,
         data={},
@@ -259,7 +287,7 @@ def promote_to_live(candidate: GroupDerivedData) -> PromotionResult:
             ).first()
 
             if current_live is not None:
-                if candidate.id <= current_live.id:
+                if candidate.version < current_live.version:
                     return PromotionResult.SUPERSEDED
                 if (candidate.cursor_date, candidate.cursor_id) < (
                     current_live.cursor_date,
@@ -302,13 +330,23 @@ def build_and_promote_derived_data(
     Returns the promoted row on success, or None if promotion was permanently
     rejected or the group no longer exists.
     """
+    from sentry.issues.derived.tasks import rebuild_group_derived_data_task
+
     try:
         derived = create_processing_row(group_id)
     except IntegrityError:
         return None
 
+    result = PromotionResult.CURSOR_BEHIND
     for attempt in range(MAX_PROMOTION_ATTEMPTS):
         _drain_log(derived, batch_size)
+
+        # Refresh version after draining — new entries may have arrived since
+        # the row was created, and the live row's version may have advanced.
+        version = _max_entry_id(group_id)
+        if version > derived.version:
+            GroupDerivedData.objects.filter(id=derived.id).update(version=version)
+            derived.version = version
 
         result = promote_to_live(derived)
         if result is PromotionResult.PROMOTED:
@@ -339,18 +377,16 @@ def build_and_promote_derived_data(
                 "attempts": MAX_PROMOTION_ATTEMPTS,
             },
         )
-        from sentry.issues.derived.tasks import rebuild_group_derived_data_task
-
         rebuild_group_derived_data_task.delay(group_id)
-    else:
-        logger.info(
-            "issues.derived.promotion_rejected",
-            extra={
-                "group_id": group_id,
-                "derived_id": derived.id,
-                "result": result.value,
-            },
-        )
+
+    logger.info(
+        "issues.derived.promotion_rejected",
+        extra={
+            "group_id": group_id,
+            "derived_id": derived.id,
+            "result": result.value,
+        },
+    )
 
     return None
 
@@ -395,10 +431,7 @@ def invalidate_group_derived_data(
     invalidation is needed. *cursor* is only meaningful with
     ``hard_delete=True``.
     """
-    from sentry.issues.derived.tasks import (
-        process_group_log_task,
-        rebuild_group_derived_data_task,
-    )
+    from sentry.issues.derived.tasks import rebuild_group_derived_data_task
 
     if not hard_delete:
         rebuild_group_derived_data_task.delay(group_id)
@@ -406,9 +439,10 @@ def invalidate_group_derived_data(
 
     if cursor is None:
         GroupDerivedData.objects.filter(group_id=group_id, is_live=True).delete()
-        process_group_log_task.delay(group_id)
+        rebuild_group_derived_data_task.delay(group_id)
         return
 
+    # Only invalidate if the row has already processed past the affected point.
     cursor_date, cursor_id = cursor
     deleted, _ = GroupDerivedData.objects.filter(
         Q(group_id=group_id, is_live=True)
@@ -423,4 +457,4 @@ def invalidate_group_derived_data(
                 "cursor_id": cursor_id,
             },
         )
-        process_group_log_task.delay(group_id)
+        rebuild_group_derived_data_task.delay(group_id)

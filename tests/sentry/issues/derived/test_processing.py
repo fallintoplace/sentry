@@ -78,6 +78,7 @@ def _publish(*, group: Group, action: GroupAction, actor: GroupActionActor = SYS
 class ProcessGroupLogTest(TestCase):
     def setUp(self) -> None:
         super().setUp()
+        # Enable mutation checking so aggregators that modify state in place fail.
         self._original_pipeline = processing.PIPELINE
         processing.PIPELINE = Pipeline(
             AGGREGATORS, version=processing.PIPELINE.version, check_mutations=True
