@@ -3834,3 +3834,13 @@ register(
     default=False,
     flags=FLAG_AUTOMATOR_MODIFIABLE,
 )
+
+# When True, derived data processing creates a live GroupDerivedData row
+# on demand for groups that don't have one yet. When False, processing is
+# a no-op until a backfill task explicitly creates and promotes a row.
+register(
+    "issues.derived-data.create-on-demand",
+    type=Bool,
+    default=True,
+    flags=FLAG_AUTOMATOR_MODIFIABLE,
+)

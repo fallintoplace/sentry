@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 from django.db import router, transaction
@@ -41,8 +42,13 @@ from sentry.issues.derived.framework import (
 )
 from sentry.issues.derived.processing import (
     PIPELINE,
+    PromotionResult,
+    build_and_promote_derived_data,
+    cleanup_stale_processing_rows,
+    create_processing_row,
     invalidate_group_derived_data,
     process_group_log,
+    promote_to_live,
 )
 from sentry.issues.derived.store import GroupDerivedDataStore
 from sentry.issues.models.groupactionlogentry import GroupActionLogEntry
@@ -72,7 +78,6 @@ def _publish(*, group: Group, action: GroupAction, actor: GroupActionActor = SYS
 class ProcessGroupLogTest(TestCase):
     def setUp(self) -> None:
         super().setUp()
-        # Enable mutation checking so aggregators that modify state in place fail.
         self._original_pipeline = processing.PIPELINE
         processing.PIPELINE = Pipeline(
             AGGREGATORS, version=processing.PIPELINE.version, check_mutations=True
@@ -97,8 +102,10 @@ class ProcessGroupLogTest(TestCase):
         assert entries[0].actor_id == user.id
 
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.cursor_id == entries[-1].id
         assert isinstance(derived.data, dict)
+        assert derived.is_live
 
     def test_incremental_processing(self) -> None:
         group = self.create_group()
@@ -106,10 +113,12 @@ class ProcessGroupLogTest(TestCase):
 
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         first_cursor = derived.cursor_id
 
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.cursor_id > first_cursor
 
     def test_noop_when_no_new_entries(self) -> None:
@@ -118,9 +127,11 @@ class ProcessGroupLogTest(TestCase):
 
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         old_updated = derived.date_updated
 
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.date_updated == old_updated
 
     def test_process_group_log_only_affects_target(self) -> None:
@@ -131,7 +142,7 @@ class ProcessGroupLogTest(TestCase):
         _publish(group=group_a, action=ViewAction(), actor=GroupActionActor.user(user.id))
         _publish(group=group_b, action=ViewAction(), actor=GroupActionActor.user(user.id))
 
-        cursor_b = GroupDerivedData.objects.get(group_id=group_b.id).cursor_id
+        cursor_b = GroupDerivedData.objects.get(group_id=group_b.id, is_live=True).cursor_id
 
         GroupActionLogEntry.objects.create(
             group_id=group_a.id,
@@ -144,7 +155,7 @@ class ProcessGroupLogTest(TestCase):
         )
         process_group_log(group_a.id)
 
-        assert GroupDerivedData.objects.get(group_id=group_b.id).cursor_id == cursor_b
+        assert GroupDerivedData.objects.get(group_id=group_b.id, is_live=True).cursor_id == cursor_b
 
     def test_batched_processing(self) -> None:
         group = self.create_group()
@@ -155,6 +166,7 @@ class ProcessGroupLogTest(TestCase):
 
         # Process in batches of 2 — should take 3 batches (2+2+1)
         derived = process_group_log(group.id, batch_size=2)
+        assert derived is not None
 
         entries = list(GroupActionLogEntry.objects.filter(group_id=group.id).order_by("id"))
         assert derived.cursor_id == entries[-1].id
@@ -174,6 +186,7 @@ class ProcessGroupLogTest(TestCase):
 
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         state = GroupDerivedDataStore.load(PIPELINE, derived)
         assert state[STATUS] == IssueStatus.OPEN
 
@@ -183,6 +196,7 @@ class ProcessGroupLogTest(TestCase):
 
         _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.data["status"] == "closed"
 
     def test_unresolve_reopens(self) -> None:
@@ -192,6 +206,7 @@ class ProcessGroupLogTest(TestCase):
         _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(user.id))
         _publish(group=group, action=UnresolveAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.data["status"] == "open"
 
     def test_duplicate_resolve_ignored(self) -> None:
@@ -201,6 +216,7 @@ class ProcessGroupLogTest(TestCase):
         _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(user.id))
         _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.data["status"] == "closed"
 
     def test_duplicate_unresolve_ignored(self) -> None:
@@ -209,6 +225,7 @@ class ProcessGroupLogTest(TestCase):
 
         _publish(group=group, action=UnresolveAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         state = GroupDerivedDataStore.load(PIPELINE, derived)
         assert state[STATUS] == IssueStatus.OPEN
 
@@ -220,35 +237,36 @@ class ProcessGroupLogTest(TestCase):
         _publish(group=group, action=UnresolveAction(), actor=GroupActionActor.user(user.id))
         _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.data["status"] == "closed"
 
     # --- invalidation ---
 
-    def test_invalidate_deletes_row(self) -> None:
+    def test_invalidate_deletes_live_row(self) -> None:
         group = self.create_group()
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
         process_group_log(group.id)
-        assert GroupDerivedData.objects.filter(group_id=group.id).exists()
+        assert GroupDerivedData.objects.filter(group_id=group.id, is_live=True).exists()
 
         invalidate_group_derived_data(group.id)
-        assert not GroupDerivedData.objects.filter(group_id=group.id).exists()
+        assert not GroupDerivedData.objects.filter(group_id=group.id, is_live=True).exists()
 
     def test_invalidate_with_cursor_deletes_if_past(self) -> None:
         group = self.create_group()
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
 
-        # Cursor at the processed entry — row should be deleted.
         invalidate_group_derived_data(group.id, cursor=(derived.cursor_date, derived.cursor_id))
-        assert not GroupDerivedData.objects.filter(group_id=group.id).exists()
+        assert not GroupDerivedData.objects.filter(group_id=group.id, is_live=True).exists()
 
     def test_invalidate_with_cursor_noop_if_not_reached(self) -> None:
         group = self.create_group()
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         old_cursor = derived.cursor_id
 
-        # Cursor beyond what we've processed — row should be untouched.
         future = derived.cursor_date.replace(year=derived.cursor_date.year + 1)
         invalidate_group_derived_data(group.id, cursor=(future, old_cursor + 1000))
         derived.refresh_from_db()
@@ -260,11 +278,29 @@ class ProcessGroupLogTest(TestCase):
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.view_count == 2
 
         invalidate_group_derived_data(group.id)
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.view_count == 2  # rebuilt from scratch
+
+    def test_invalidate_soft_schedules_rebuild(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+        derived = process_group_log(group.id)
+        assert derived is not None
+        original_id = derived.id
+
+        with patch("sentry.issues.derived.tasks.rebuild_group_derived_data_task") as mock_task:
+            invalidate_group_derived_data(group.id, hard_delete=False)
+            mock_task.delay.assert_called_once_with(group.id)
+
+        # Live row is still in place
+        derived.refresh_from_db()
+        assert derived.id == original_id
+        assert derived.is_live
 
     def test_resolved_in_pull_request_closes(self) -> None:
         group = self.create_group()
@@ -276,7 +312,139 @@ class ProcessGroupLogTest(TestCase):
             actor=GroupActionActor.user(user.id),
         )
         derived = process_group_log(group.id)
+        assert derived is not None
         assert derived.data["status"] == "closed"
+
+    def test_noop_when_on_demand_disabled(self) -> None:
+        group = self.create_group()
+
+        with self.options({"issues.derived-data.create-on-demand": False}):
+            # Publish with async strategy so inline processing doesn't create a row
+            with patch("sentry.issues.derived.tasks.process_group_log_task"):
+                _publish(
+                    group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id)
+                )
+
+            derived = process_group_log(group.id)
+
+        assert derived is None
+        assert not GroupDerivedData.objects.filter(group_id=group.id, is_live=True).exists()
+
+
+# --- Non-live row lifecycle ---
+
+
+@with_feature("projects:issue-action-log-write-to-db")
+class PromoteToLiveTest(TestCase):
+    def test_promote_with_no_existing_live(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        row = create_processing_row(group.id)
+        processing._drain_log(row)
+        assert promote_to_live(row) is PromotionResult.PROMOTED
+        assert row.is_live
+
+        row.refresh_from_db()
+        assert row.is_live
+        assert row.view_count == 1
+
+    def test_promote_replaces_older_live(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        old = process_group_log(group.id)
+        assert old is not None
+        old_id = old.id
+
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        new = create_processing_row(group.id)
+        processing._drain_log(new)
+        assert promote_to_live(new) is PromotionResult.PROMOTED
+
+        assert not GroupDerivedData.objects.filter(id=old_id).exists()
+        assert new.is_live
+        assert new.view_count == 2
+
+    def test_promote_rejected_if_candidate_older(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        old_candidate = create_processing_row(group.id)
+        processing._drain_log(old_candidate)
+
+        # Create and promote a newer candidate first
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+        new_candidate = create_processing_row(group.id)
+        processing._drain_log(new_candidate)
+        assert promote_to_live(new_candidate) is PromotionResult.PROMOTED
+
+        assert promote_to_live(old_candidate) is PromotionResult.SUPERSEDED
+
+        # New candidate is still live
+        live = GroupDerivedData.objects.get(group_id=group.id, is_live=True)
+        assert live.id == new_candidate.id
+
+    def test_promote_rejected_if_cursor_behind(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        # Create a live row that has processed everything
+        live = process_group_log(group.id)
+        assert live is not None
+
+        # Create a candidate that only processes the first entry
+        candidate = create_processing_row(group.id)
+        processing._process_batch(PIPELINE, candidate, batch_size=1)
+
+        # Candidate cursor is behind the live row
+        assert (candidate.cursor_date, candidate.cursor_id) < (
+            live.cursor_date,
+            live.cursor_id,
+        )
+        assert promote_to_live(candidate) is PromotionResult.CURSOR_BEHIND
+
+    def test_build_and_promote(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+        _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(self.user.id))
+
+        derived = build_and_promote_derived_data(group.id)
+        assert derived is not None
+        assert derived.is_live
+        assert derived.view_count == 1
+        assert derived.data["status"] == "closed"
+
+    def test_build_and_promote_replaces_stale_live(self) -> None:
+        group = self.create_group()
+        user = self.user
+
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
+        old = process_group_log(group.id)
+        assert old is not None
+        old_id = old.id
+
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
+        new = build_and_promote_derived_data(group.id)
+        assert new is not None
+        assert new.id != old_id
+        assert new.view_count == 2
+        assert not GroupDerivedData.objects.filter(id=old_id).exists()
+
+    def test_cleanup_stale_processing_rows(self) -> None:
+        group = self.create_group()
+        row = create_processing_row(group.id)
+
+        assert cleanup_stale_processing_rows(max_age=timedelta(hours=1)) == 0
+
+        GroupDerivedData.objects.filter(id=row.id).update(
+            date_added=row.date_added - timedelta(hours=2)
+        )
+
+        assert cleanup_stale_processing_rows(max_age=timedelta(hours=1)) == 1
+        assert not GroupDerivedData.objects.filter(id=row.id).exists()
 
 
 # --- Pure Python tests (no DB) ---
@@ -445,6 +613,7 @@ class GroupDerivedDataStoreTest(TestCase):
         group = self.create_group()
         derived = GroupDerivedData.objects.create(
             group=group,
+            is_live=True,
             data={},
         )
         state = GroupDerivedDataStore.load(PIPELINE, derived)
@@ -455,6 +624,7 @@ class GroupDerivedDataStoreTest(TestCase):
         group = self.create_group()
         derived = GroupDerivedData.objects.create(
             group=group,
+            is_live=True,
             view_count=3,
             progress="diagnosed",
             data={"status": "closed"},
@@ -469,6 +639,7 @@ class GroupDerivedDataStoreTest(TestCase):
         group = self.create_group()
         derived = GroupDerivedData.objects.create(
             group=group,
+            is_live=True,
             progress=None,
             data={},
         )
@@ -482,6 +653,7 @@ class GroupDerivedDataStoreTest(TestCase):
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(user.id))
         _publish(group=group, action=ResolveAction(), actor=GroupActionActor.user(user.id))
         first = process_group_log(group.id)
+        assert first is not None
 
         first_data = first.data.copy()
         first_view_count = first.view_count
@@ -490,6 +662,7 @@ class GroupDerivedDataStoreTest(TestCase):
 
         invalidate_group_derived_data(group.id)
         second = process_group_log(group.id)
+        assert second is not None
 
         assert second.data == first_data
         assert second.view_count == first_view_count
@@ -533,6 +706,7 @@ class GroupDerivedDataStoreTest(TestCase):
 
         _publish(group=group, action=ViewAction(), actor=actor)
         derived = process_group_log(group.id)
+        assert derived is not None
 
         state = GroupDerivedDataStore.load(PIPELINE, derived)
         assert state[PROGRESS] == IssueProgressState.IDENTIFIED
@@ -540,6 +714,7 @@ class GroupDerivedDataStoreTest(TestCase):
 
         _publish(group=group, action=ResolveAction(), actor=actor)
         derived = process_group_log(group.id)
+        assert derived is not None
 
         state = GroupDerivedDataStore.load(PIPELINE, derived)
         assert state[PROGRESS] is None
@@ -547,6 +722,7 @@ class GroupDerivedDataStoreTest(TestCase):
 
         _publish(group=group, action=UnresolveAction(), actor=actor)
         derived = process_group_log(group.id)
+        assert derived is not None
 
         state = GroupDerivedDataStore.load(PIPELINE, derived)
         assert state[PROGRESS] == IssueProgressState.IDENTIFIED
@@ -559,8 +735,6 @@ class _IntentionalRollback(Exception):
 
 @with_feature("projects:issue-action-log-write-to-db")
 class DerivedDataTransactionTest(TestCase):
-    """Verify derived data processing respects transaction boundaries."""
-
     def test_rolled_back_action_does_not_produce_derived_data(self) -> None:
         group = self.create_group()
 
@@ -592,6 +766,6 @@ class DerivedDataTransactionTest(TestCase):
         _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
 
         assert GroupActionLogEntry.objects.filter(group_id=group.id).count() == 1
-        assert GroupDerivedData.objects.filter(group_id=group.id).exists()
-        derived = GroupDerivedData.objects.get(group_id=group.id)
+        assert GroupDerivedData.objects.filter(group_id=group.id, is_live=True).exists()
+        derived = GroupDerivedData.objects.get(group_id=group.id, is_live=True)
         assert derived.view_count == 1
