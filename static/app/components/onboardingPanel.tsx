@@ -2,12 +2,18 @@ import styled from '@emotion/styled';
 
 import {Panel} from 'sentry/components/panels/panel';
 
+/**
+ * @deprecated Use `EmptyState` from `@sentry/scraps/emptyState` instead.
+ */
 interface Props extends React.ComponentProps<typeof Panel> {
   children: React.ReactNode;
   image?: React.ReactNode;
   noCenter?: boolean;
 }
 
+/**
+ * @deprecated Use `EmptyState` from `@sentry/scraps/emptyState` instead.
+ */
 export function OnboardingPanel({image, noCenter, children, ...props}: Props) {
   return (
     <Panel {...props}>
