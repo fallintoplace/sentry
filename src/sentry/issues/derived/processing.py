@@ -154,15 +154,27 @@ def _process_batch(
         return bool(_entries_after_cursor(group_id, derived.cursor_date, derived.cursor_id, 1))
 
 
+DEFAULT_TIME_LIMIT = timedelta(seconds=8)
+
+
 def _drain_log(
     derived: GroupDerivedData,
     batch_size: int = DEFAULT_BATCH_SIZE,
     pipeline: Pipeline[GroupActionLogEntry] | None = None,
-) -> None:
-    """Process all pending log entries into *derived*, batching as needed."""
+    time_limit: timedelta = DEFAULT_TIME_LIMIT,
+) -> bool:
+    """Process pending log entries into *derived*, batching as needed.
+
+    Returns True if all entries were processed, False if the time limit was
+    reached and more entries remain. The limit is checked between batches,
+    so a single slow batch can exceed it.
+    """
+    deadline = datetime.now(UTC) + time_limit
     p = pipeline or PIPELINE
     while _process_batch(p, derived, batch_size):
-        pass
+        if datetime.now(UTC) >= deadline:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -180,13 +192,17 @@ def process_group_log(
     Returns None if no live row exists and on-demand creation is disabled.
     Raises Group.DoesNotExist if the group has been deleted.
     """
+    from sentry.issues.derived.tasks import process_group_log_task
+
     with transaction.atomic(using=router.db_for_write(GroupDerivedData)):
         derived = _ensure_derived(group_id)
 
     if derived is None:
         return None
 
-    _drain_log(derived, batch_size, pipeline)
+    drained = _drain_log(derived, batch_size, pipeline)
+    if not drained:
+        process_group_log_task.delay(group_id)
     return derived
 
 

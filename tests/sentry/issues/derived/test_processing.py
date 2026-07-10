@@ -447,6 +447,67 @@ class PromoteToLiveTest(TestCase):
         assert cleanup_stale_processing_rows(max_age=timedelta(hours=1)) == 1
         assert not GroupDerivedData.objects.filter(id=row.id).exists()
 
+    def test_drain_log_respects_time_limit(self) -> None:
+        group = self.create_group()
+        for _ in range(5):
+            _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        row = create_processing_row(group.id)
+
+        # Zero time limit forces bail after first batch
+        drained = processing._drain_log(row, batch_size=2, time_limit=timedelta(0))
+        assert not drained
+        # Processed one batch (2 entries) but not all 5
+        assert row.cursor_id > 0
+        entries = list(GroupActionLogEntry.objects.filter(group_id=group.id).order_by("id"))
+        assert row.cursor_id < entries[-1].id
+
+    def test_process_group_log_reenqueues_on_partial_drain(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        with (
+            patch("sentry.issues.derived.processing._drain_log", return_value=False),
+            patch("sentry.issues.derived.tasks.process_group_log_task") as mock_task,
+        ):
+            derived = process_group_log(group.id)
+
+        assert derived is not None
+        mock_task.delay.assert_called_once_with(group.id)
+
+    def test_build_and_promote_exhaustion_reenqueues(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+
+        # Create a live row, then keep advancing its cursor so the candidate
+        # can never catch up (simulated by patching promote_to_live).
+        process_group_log(group.id)
+
+        with patch(
+            "sentry.issues.derived.processing.promote_to_live",
+            return_value=PromotionResult.CURSOR_BEHIND,
+        ):
+            with patch("sentry.issues.derived.tasks.rebuild_group_derived_data_task") as mock_task:
+                result = build_and_promote_derived_data(group.id)
+
+        assert result is None
+        mock_task.delay.assert_called_once_with(group.id)
+
+    def test_build_and_promote_breaks_on_superseded(self) -> None:
+        group = self.create_group()
+        _publish(group=group, action=ViewAction(), actor=GroupActionActor.user(self.user.id))
+        process_group_log(group.id)
+
+        with patch(
+            "sentry.issues.derived.processing.promote_to_live",
+            return_value=PromotionResult.SUPERSEDED,
+        ) as mock_promote:
+            result = build_and_promote_derived_data(group.id)
+
+        assert result is None
+        # Should only try once, not retry
+        assert mock_promote.call_count == 1
+
 
 # --- Pure Python tests (no DB) ---
 
