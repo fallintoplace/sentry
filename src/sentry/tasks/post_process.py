@@ -1624,6 +1624,11 @@ def process_gpu_crash_dump_async(job: PostProcessJob) -> None:
     if not is_native_platform(event.platform) or not has_gpu_crash_dump_attachment(event.data):
         return
 
+    # Count every GPU crash dump that reaches us, regardless of whether we go on
+    # to process it (flag off / killed / sampled out). This is the "how many
+    # .nv-gpudmp are arriving right now" signal, decoupled from teapot rollout.
+    metrics.incr("gpu.crash_dump.detected", tags={"platform": event.platform})
+
     organization = event.project.organization
     if not features.has("organizations:gpu-crash-symbolication", organization):
         return
