@@ -77,6 +77,19 @@ const debouncedTrackIntegrationSearch = debounce(
   TEXT_SEARCH_ANALYTICS_DEBOUNCE_IN_MS
 );
 
+function filterIntegrations(
+  list: AppOrProviderOrPlugin[],
+  search: string,
+  category: string
+) {
+  const term = search.toLowerCase();
+  return list.filter(
+    integration =>
+      integration.name.toLowerCase().includes(term) &&
+      (!category || getCategoriesForIntegration(integration).includes(category))
+  );
+}
+
 function useIntegrationList() {
   const queryOptions = {staleTime: 0};
   const organization = useOrganization();
@@ -229,22 +242,8 @@ export default function IntegrationListDirectory() {
     (!category || webhookCategories.includes(category));
 
   const displayList = useMemo(() => {
-    let listToDisplay = [...list];
-
-    if (search) {
-      listToDisplay = list.filter(integration =>
-        integration.name.toLowerCase().includes(search.toLowerCase())
-      );
-    }
-
-    if (category) {
-      listToDisplay = listToDisplay.filter(integration =>
-        getCategoriesForIntegration(integration).includes(category)
-      );
-    }
-
     return sortIntegrations({
-      list: listToDisplay,
+      list: filterIntegrations(list, search, category),
       sentryAppInstalls: appInstalls,
       integrationInstalls: integrations,
     });
@@ -285,12 +284,12 @@ export default function IntegrationListDirectory() {
       if (newSearch) {
         debouncedTrackIntegrationSearch({
           search_term: newSearch,
-          num_results: list.length,
+          num_results: filterIntegrations(list, newSearch, category).length,
           organization,
         });
       }
     },
-    [location, navigate, organization, list.length]
+    [location, navigate, organization, list, category]
   );
 
   /**
