@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+from typing import Any, cast
 from unittest import mock
 
+from sentry.models.project import Project
 from sentry.tasks.gpu_crash import symbolicate_gpu_crash
 from sentry.testutils.helpers import Feature
 from sentry.testutils.helpers.options import override_options
@@ -27,12 +29,12 @@ class _FakeAttachment:
         return io.BytesIO(self._data)
 
 
-def _completed_response() -> dict:
+def _completed_response() -> dict[str, Any]:
     return {"status": "completed", "fault_category": "shader_hang", "frames": [], "markers": []}
 
 
 @django_db_all
-def test_task_happy_path_produces_occurrence(default_project) -> None:
+def test_task_happy_path_produces_occurrence(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -49,7 +51,7 @@ def test_task_happy_path_produces_occurrence(default_project) -> None:
 
 
 @django_db_all
-def test_task_skipped_when_teapot_disabled(default_project) -> None:
+def test_task_skipped_when_teapot_disabled(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": False}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -63,7 +65,7 @@ def test_task_skipped_when_teapot_disabled(default_project) -> None:
 
 
 @django_db_all
-def test_task_skipped_when_flag_off(default_project) -> None:
+def test_task_skipped_when_flag_off(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         mock.patch(FIND_DUMP) as find,
@@ -76,7 +78,7 @@ def test_task_skipped_when_flag_off(default_project) -> None:
 
 
 @django_db_all
-def test_task_skipped_when_no_attachment(default_project) -> None:
+def test_task_skipped_when_no_attachment(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -102,7 +104,7 @@ def test_task_skipped_when_project_missing() -> None:
 
 
 @django_db_all
-def test_task_once_guard_dedupes(default_project) -> None:
+def test_task_once_guard_dedupes(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -120,7 +122,7 @@ def test_task_once_guard_dedupes(default_project) -> None:
 
 
 @django_db_all
-def test_task_teapot_unavailable_is_noop(default_project) -> None:
+def test_task_teapot_unavailable_is_noop(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -136,7 +138,7 @@ def test_task_teapot_unavailable_is_noop(default_project) -> None:
 
 
 @django_db_all
-def test_task_never_raises_on_internal_error(default_project) -> None:
+def test_task_never_raises_on_internal_error(default_project: Project) -> None:
     # Even a hard failure deep in _run must be swallowed — the task always
     # succeeds so a poison event can't loop.
     with mock.patch(_RUN, side_effect=RuntimeError("boom")):
@@ -149,13 +151,18 @@ def test_task_never_raises_on_internal_error(default_project) -> None:
 
 import types  # noqa: E402
 
-from sentry.tasks.post_process import process_gpu_crash_dump_async  # noqa: E402
+from sentry.tasks.post_process import (  # noqa: E402
+    PostProcessJob,
+    process_gpu_crash_dump_async,
+)
 
 HAS_DUMP = "sentry.lang.native.utils.has_gpu_crash_dump_attachment"
 APPLY_ASYNC = "sentry.tasks.gpu_crash.symbolicate_gpu_crash.apply_async"
 
 
-def _job(project, *, is_reprocessed=False, platform="native"):
+def _job(
+    project: Project, *, is_reprocessed: bool = False, platform: str = "native"
+) -> PostProcessJob:
     event = types.SimpleNamespace(
         platform=platform,
         data={},
@@ -164,11 +171,13 @@ def _job(project, *, is_reprocessed=False, platform="native"):
         event_id="cpu-evt",
         group_id=1,
     )
-    return {"event": event, "is_reprocessed": is_reprocessed}
+    # A lightweight stand-in for the GroupEvent the trigger reads; cast so the
+    # SimpleNamespace satisfies the PostProcessJob TypedDict for the checker.
+    return cast(PostProcessJob, {"event": event, "is_reprocessed": is_reprocessed})
 
 
 @django_db_all
-def test_trigger_schedules_when_eligible(default_project) -> None:
+def test_trigger_schedules_when_eligible(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True, "teapot.crash-dump.sample-rate": 1.0}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -182,7 +191,7 @@ def test_trigger_schedules_when_eligible(default_project) -> None:
 
 
 @django_db_all
-def test_trigger_skips_reprocessed(default_project) -> None:
+def test_trigger_skips_reprocessed(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -195,7 +204,7 @@ def test_trigger_skips_reprocessed(default_project) -> None:
 
 
 @django_db_all
-def test_trigger_skips_without_dump(default_project) -> None:
+def test_trigger_skips_without_dump(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -208,7 +217,7 @@ def test_trigger_skips_without_dump(default_project) -> None:
 
 
 @django_db_all
-def test_trigger_skips_when_disabled(default_project) -> None:
+def test_trigger_skips_when_disabled(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": False}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -221,7 +230,7 @@ def test_trigger_skips_when_disabled(default_project) -> None:
 
 
 @django_db_all
-def test_trigger_sampled_out(default_project) -> None:
+def test_trigger_sampled_out(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True, "teapot.crash-dump.sample-rate": 0.0}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -234,7 +243,7 @@ def test_trigger_sampled_out(default_project) -> None:
 
 
 @django_db_all
-def test_trigger_schedule_error_is_swallowed(default_project) -> None:
+def test_trigger_schedule_error_is_swallowed(default_project: Project) -> None:
     # A scheduling failure must never break post-processing of the CPU issue.
     with (
         override_options({"teapot.enabled": True, "teapot.crash-dump.sample-rate": 1.0}),

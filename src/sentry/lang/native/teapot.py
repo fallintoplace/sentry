@@ -16,7 +16,7 @@ Two wire formats, picked per-request based on attachment storage:
 * **multipart with raw bytes** (fallback): when objectstore isn't in the
   loop (self-hosted Sentry installs without the objectstore service, or
   attachments still on the legacy V1 path) we load bytes via
-  `CachedAttachment.load_data` and POST them as multipart fields.
+  `TeapotAttachment.load_data` and POST them as multipart fields.
 
 Unlike Symbolicator, teapot is synchronous — one request, one response, no
 polling. The client therefore skips the task-id / worker-id state that
@@ -26,8 +26,8 @@ polling. The client therefore skips the task-id / worker-id state that
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Sequence
+from typing import Any, Protocol
 
 import orjson
 import requests
@@ -35,10 +35,34 @@ import sentry_sdk
 from django.conf import settings
 
 from sentry import options
-from sentry.attachments import CachedAttachment
 from sentry.objectstore import get_attachments_session, get_symbolicator_url
 
 logger = logging.getLogger(__name__)
+
+
+class TeapotAttachment(Protocol):
+    """The subset of the ``CachedAttachment`` surface the teapot client needs.
+
+    Structural typing lets callers pass a real ``CachedAttachment``, the
+    ``EventAttachment``-backed adapter from the async task, or a test double —
+    anything exposing a ``stored_id`` and byte loader — without subclassing.
+    """
+
+    stored_id: str | None
+
+    def load_data(self, project: Any) -> bytes: ...
+
+
+def _require_stored_id(att: TeapotAttachment) -> str:
+    """Return the attachment's ``stored_id``, asserting it's set.
+
+    Only called on the JSON-by-reference path, which ``_all_stored`` gates on
+    every attachment having a ``stored_id`` — this just narrows ``str | None``
+    to ``str`` for the type checker.
+    """
+    assert att.stored_id is not None
+    return att.stored_id
+
 
 # Fallbacks if the options aren't available for some reason. The live values
 # come from `teapot.timeout-seconds` / `teapot.max-attempts` so ops can tune
@@ -81,7 +105,7 @@ def _resolve_url() -> str | None:
 
 
 def _all_stored(
-    dump: CachedAttachment, shader_debug_info: Iterable[tuple[str, CachedAttachment]]
+    dump: TeapotAttachment, shader_debug_info: Iterable[tuple[str, TeapotAttachment]]
 ) -> bool:
     """True iff every input attachment is already in objectstore.
 
@@ -125,8 +149,8 @@ class TeapotClient:
 
     def symbolicate(
         self,
-        dump: CachedAttachment,
-        shader_debug_info: list[tuple[str, CachedAttachment]] | None = None,
+        dump: TeapotAttachment,
+        shader_debug_info: Sequence[tuple[str, TeapotAttachment]] | None = None,
     ) -> dict[str, Any]:
         shader_debug_info = shader_debug_info or []
         url = f"{self.base_url}/symbolicate"
@@ -148,8 +172,8 @@ class TeapotClient:
         self,
         url: str,
         headers: dict[str, str],
-        dump: CachedAttachment,
-        shader_debug_info: list[tuple[str, CachedAttachment]],
+        dump: TeapotAttachment,
+        shader_debug_info: Sequence[tuple[str, TeapotAttachment]],
     ) -> dict[str, Any]:
         """Pass attachments to teapot by reference — bytes stay in objectstore.
 
@@ -161,7 +185,7 @@ class TeapotClient:
         """
 
         session = get_attachments_session(self.project.organization_id, self.project.id)
-        dump_url = get_symbolicator_url(session, dump.stored_id)
+        dump_url = get_symbolicator_url(session, _require_stored_id(dump))
         body: dict[str, Any] = {
             "event_id": self.event_id,
             "project_id": str(self.project.id),
@@ -175,7 +199,7 @@ class TeapotClient:
             "shader_debug_info": [
                 {
                     "uid": uid,
-                    "storage_url": get_symbolicator_url(session, att.stored_id),
+                    "storage_url": get_symbolicator_url(session, _require_stored_id(att)),
                     "storage_token": session.mint_token(),
                 }
                 for uid, att in shader_debug_info
@@ -189,8 +213,8 @@ class TeapotClient:
         self,
         url: str,
         headers: dict[str, str],
-        dump: CachedAttachment,
-        shader_debug_info: list[tuple[str, CachedAttachment]],
+        dump: TeapotAttachment,
+        shader_debug_info: Sequence[tuple[str, TeapotAttachment]],
     ) -> dict[str, Any]:
         """Fallback: load bytes via the attachment cache and POST them inline.
 
@@ -290,8 +314,8 @@ class TeapotClient:
 def submit_to_teapot(
     project: Any,
     event_id: str,
-    dump: CachedAttachment,
-    shader_debug_info: list[tuple[str, CachedAttachment]] | None = None,
+    dump: TeapotAttachment,
+    shader_debug_info: Sequence[tuple[str, TeapotAttachment]] | None = None,
 ) -> dict[str, Any] | None:
     """Best-effort teapot invocation. Returns None on any failure.
 

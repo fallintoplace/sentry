@@ -19,7 +19,7 @@ from unittest import mock
 import pytest
 import requests
 
-from sentry.lang.native.gpu import _produce_gpu_occurrence
+from sentry.lang.native.gpu import _normalize_gpu_frames, _produce_gpu_occurrence
 from sentry.lang.native.processing import (
     GPU_CRASH_DUMP_ATTACHMENT_TYPE,
     _merge_gpu_response,
@@ -888,3 +888,29 @@ def test_grouptype_registered_at_import_time() -> None:
 
     assert registry.get_by_type_id(GpuCrashGroupType.type_id) is GpuCrashGroupType
     assert registry.get_by_slug("gpu_crash") is GpuCrashGroupType
+
+
+def test_normalize_gpu_frames_tolerates_non_mapping_data() -> None:
+    """teapot's `frames[].data` is external and may not be a dict.
+
+    A truthy non-dict (string/list) must not crash `dict(...)` or the
+    `shader_hash` lookup — the frame is still normalized, just without `data`.
+    """
+
+    frames = [
+        {"function": "vertex", "data": "not-a-dict"},
+        {"function": "pixel", "data": [1, 2, 3]},
+        {"function": "compute", "data": {"shader_hash": 12345}},  # non-str hash
+        {"function": "ok", "data": {"shader_hash": "abc123"}},
+    ]
+
+    result = _normalize_gpu_frames(frames)
+
+    assert [f["function"] for f in result] == ["vertex", "pixel", "compute", "ok"]
+    # Non-dict data is dropped (no crash); no synthetic package is derived.
+    assert "package" not in result[0]
+    assert "package" not in result[1]
+    # Non-str shader_hash is ignored rather than crashing `.startswith`.
+    assert "package" not in result[2]
+    # A well-formed str shader_hash still produces a package.
+    assert result[3]["package"] == "shader_abc123"

@@ -45,10 +45,14 @@ APPLECRASHREPORT_ATTACHMENT_TYPE = "event.applecrashreport"
 # GPU crash handling lives in sentry.lang.native.gpu; re-export the public
 # names here so existing imports (the symbolication task hook, tests)
 # continue to work without touching their import paths.
-from sentry.lang.native.gpu import (  # noqa: E402, F401
-    GPU_CRASH_DUMP_ATTACHMENT_TYPE,
-    _merge_gpu_response,
-    process_gpu_crash_dump,
+from sentry.lang.native.gpu import (  # noqa: E402
+    GPU_CRASH_DUMP_ATTACHMENT_TYPE as GPU_CRASH_DUMP_ATTACHMENT_TYPE,
+)
+from sentry.lang.native.gpu import (
+    _merge_gpu_response as _merge_gpu_response,
+)
+from sentry.lang.native.gpu import (
+    process_gpu_crash_dump as process_gpu_crash_dump,
 )
 
 # Rules for rewriting the debug file of the first module

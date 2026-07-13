@@ -608,15 +608,21 @@ def _normalize_gpu_frames(teapot_frames: Any) -> list[dict[str, Any]]:
             value = raw.get(src)
             if value is not None:
                 frame[dst] = value
-        if raw.get("data"):
-            frame["data"] = dict(raw["data"])
+        # `data` comes from teapot's external response; only trust it if it's a
+        # mapping. A truthy non-dict (str/list) would crash both `dict(...)` and
+        # the `.get()` below.
+        raw_data = raw.get("data")
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        if raw_data:
+            frame["data"] = dict(raw_data)
 
         # Synthesise a package from the shader hash so the module column
         # renders something useful (only for real shader frames; synthetic
         # frames already have a meaningful `module` like "Graphics").
-        frame_data = raw.get("data") or {}
-        shader_hash = frame_data.get("shader_hash")
-        if shader_hash and not frame.get("package"):
+        shader_hash = raw_data.get("shader_hash")
+        # shader_hash comes from teapot's response; don't assume it's a str.
+        if isinstance(shader_hash, str) and shader_hash and not frame.get("package"):
             frame["package"] = (
                 shader_hash if shader_hash.startswith("shader_") else f"shader_{shader_hash}"
             )
