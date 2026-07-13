@@ -5,10 +5,11 @@ import {useQuery} from '@tanstack/react-query';
 import debounce from 'lodash/debounce';
 import startCase from 'lodash/startCase';
 
+import {Alert} from '@sentry/scraps/alert';
 import {DocIntegrationAvatar, SentryAppAvatar} from '@sentry/scraps/avatar';
 import type {SelectOption} from '@sentry/scraps/compactSelect';
 import {Container, Flex, Stack} from '@sentry/scraps/layout';
-import {ExternalLink} from '@sentry/scraps/link';
+import {ExternalLink, Link} from '@sentry/scraps/link';
 import {Select} from '@sentry/scraps/select';
 
 import {
@@ -89,6 +90,8 @@ function filterIntegrations(
       (!category || getCategoriesForIntegration(integration).includes(category))
   );
 }
+
+const WEBHOOK_SEARCH_TERMS = ['webhook', 'webhooks', 'hooks'];
 
 function useIntegrationList() {
   const queryOptions = {staleTime: 0};
@@ -442,6 +445,32 @@ export default function IntegrationListDirectory() {
         <Stack>
           <OrganizationPermissionAlert access={['org:integrations']} />
           <ReinstallAlert integrations={integrations} />
+          {WEBHOOK_SEARCH_TERMS.includes(search.trim().toLowerCase()) && (
+            <Alert.Container>
+              <Alert variant="info">
+                {tct(
+                  'Looking for webhooks? [link:Create an internal integration] to push Sentry data to your own services.',
+                  {
+                    link: (
+                      <Link
+                        to={`/settings/${organization.slug}/developer-settings/new-internal/`}
+                        onClick={() =>
+                          trackIntegrationAnalytics(
+                            'integrations.directory_internal_integration_banner_clicked',
+                            {
+                              view: 'integrations_directory',
+                              search_term: search,
+                              organization,
+                            }
+                          )
+                        }
+                      />
+                    ),
+                  }
+                )}
+              </Alert>
+            </Alert.Container>
+          )}
           <Panel>
             <PanelBody data-test-id="integration-panel">
               {displayList.length || showLegacyWebhookRow ? (
