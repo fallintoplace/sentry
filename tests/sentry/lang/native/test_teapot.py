@@ -113,6 +113,13 @@ def _configured_teapot(url: str = "http://teapot.test") -> Iterator[None]:
         yield
 
 
+@pytest.fixture(autouse=True)
+def _skip_retry_backoff() -> Iterator[None]:
+    """Skip teapot's inter-retry backoff sleep so retry tests stay instant."""
+    with mock.patch("sentry.lang.native.teapot.time.sleep"):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # _merge_gpu_response
 # ---------------------------------------------------------------------------

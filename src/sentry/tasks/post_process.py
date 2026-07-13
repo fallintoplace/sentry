@@ -1614,14 +1614,22 @@ def process_gpu_crash_dump_async(job: PostProcessJob) -> None:
     if job["is_reprocessed"]:
         return
 
-    from sentry.lang.native.utils import has_gpu_crash_dump_attachment, is_native_platform
+    from sentry.lang.native.utils import (
+        find_gpu_crash_dump_eventattachment,
+        is_native_platform,
+    )
 
     event = job["event"]
 
-    # Cheap, in-memory check first: has_gpu_crash_dump_attachment reads the
-    # event's `_attachments` list (no cache/DB hit), so events without a GPU
-    # dump — the overwhelming majority — bail out essentially for free.
-    if not is_native_platform(event.platform) or not has_gpu_crash_dump_attachment(event.data):
+    # Cheap, in-memory platform gate first, so non-native events (the
+    # overwhelming majority) bail out for free. We cannot use the event's
+    # `_attachments` list here: `save_event_attachments` pops it before
+    # post-processing (see `store.py` `data.pop("_attachments")`). So for
+    # native events we look the dump up durably in `EventAttachment` — the
+    # ERROR pipeline already queries that table (`update_existing_attachments`).
+    if not is_native_platform(event.platform):
+        return
+    if find_gpu_crash_dump_eventattachment(event.project_id, event.event_id) is None:
         return
 
     # Count every GPU crash dump that reaches us, regardless of whether we go on

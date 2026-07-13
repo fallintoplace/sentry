@@ -110,15 +110,17 @@ def test_task_once_guard_dedupes(default_project: Project) -> None:
         Feature("organizations:gpu-crash-symbolication"),
         mock.patch(FIND_DUMP, return_value=_FakeAttachment("dump.nv-gpudmp", b"dump")),
         mock.patch(FIND_SHADERS, return_value=[]),
-        mock.patch(SUBMIT, return_value=_completed_response()) as submit,
-        mock.patch(EMIT, return_value=True),
+        mock.patch(SUBMIT, return_value=_completed_response()),
+        mock.patch(EMIT, return_value=True) as emit,
         mock.patch(GET_EVENT, return_value=None),
     ):
         symbolicate_gpu_crash(project_id=default_project.id, cpu_event_id="evt-once")
         symbolicate_gpu_crash(project_id=default_project.id, cpu_event_id="evt-once")
 
-    # Second delivery is deduped before the teapot call.
-    assert submit.call_count == 1
+    # The once-guard is claimed just before emit (only a successful decode
+    # claims it), so the second delivery produces no duplicate occurrence. Its
+    # teapot call would be a cheap idempotency-key replay in production.
+    assert emit.call_count == 1
 
 
 @django_db_all
@@ -156,7 +158,6 @@ from sentry.tasks.post_process import (  # noqa: E402
     process_gpu_crash_dump_async,
 )
 
-HAS_DUMP = "sentry.lang.native.utils.has_gpu_crash_dump_attachment"
 APPLY_ASYNC = "sentry.tasks.gpu_crash.symbolicate_gpu_crash.apply_async"
 
 
@@ -181,7 +182,7 @@ def test_trigger_schedules_when_eligible(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True, "teapot.crash-dump.sample-rate": 1.0}),
         Feature("organizations:gpu-crash-symbolication"),
-        mock.patch(HAS_DUMP, return_value=True),
+        mock.patch(FIND_DUMP, return_value=_FakeAttachment("dump.nv-gpudmp", b"x")),
         mock.patch(APPLY_ASYNC) as apply_async,
     ):
         process_gpu_crash_dump_async(_job(default_project))
@@ -195,7 +196,7 @@ def test_trigger_skips_reprocessed(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
-        mock.patch(HAS_DUMP, return_value=True),
+        mock.patch(FIND_DUMP, return_value=_FakeAttachment("dump.nv-gpudmp", b"x")),
         mock.patch(APPLY_ASYNC) as apply_async,
     ):
         process_gpu_crash_dump_async(_job(default_project, is_reprocessed=True))
@@ -208,7 +209,7 @@ def test_trigger_skips_without_dump(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
-        mock.patch(HAS_DUMP, return_value=False),
+        mock.patch(FIND_DUMP, return_value=None),
         mock.patch(APPLY_ASYNC) as apply_async,
     ):
         process_gpu_crash_dump_async(_job(default_project))
@@ -221,7 +222,7 @@ def test_trigger_skips_when_disabled(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": False}),
         Feature("organizations:gpu-crash-symbolication"),
-        mock.patch(HAS_DUMP, return_value=True),
+        mock.patch(FIND_DUMP, return_value=_FakeAttachment("dump.nv-gpudmp", b"x")),
         mock.patch(APPLY_ASYNC) as apply_async,
     ):
         process_gpu_crash_dump_async(_job(default_project))
@@ -234,7 +235,7 @@ def test_trigger_sampled_out(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True, "teapot.crash-dump.sample-rate": 0.0}),
         Feature("organizations:gpu-crash-symbolication"),
-        mock.patch(HAS_DUMP, return_value=True),
+        mock.patch(FIND_DUMP, return_value=_FakeAttachment("dump.nv-gpudmp", b"x")),
         mock.patch(APPLY_ASYNC) as apply_async,
     ):
         process_gpu_crash_dump_async(_job(default_project))
@@ -248,7 +249,7 @@ def test_trigger_schedule_error_is_swallowed(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True, "teapot.crash-dump.sample-rate": 1.0}),
         Feature("organizations:gpu-crash-symbolication"),
-        mock.patch(HAS_DUMP, return_value=True),
+        mock.patch(FIND_DUMP, return_value=_FakeAttachment("dump.nv-gpudmp", b"x")),
         mock.patch(APPLY_ASYNC, side_effect=RuntimeError("broker down")),
     ):
         process_gpu_crash_dump_async(_job(default_project))

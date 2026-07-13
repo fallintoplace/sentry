@@ -36,9 +36,16 @@ class GpuCrashGroupType(GroupType):
     # non-ERROR is what makes the issue show up in the default feed.
     category = GroupCategory.OUTAGE.value
     category_v2 = GroupCategory.OUTAGE.value
-    # Dark until the organizations:gpu-crash-symbolication flag enables the
-    # producer side. `released=False` additionally gates ingest via the
-    # auto-generated `organizations:issue-gpu-crash-ingest` feature.
+    # Dark launch. A FULL rollout requires enabling all of these together —
+    # flipping only the symbolication flag produces occurrences that the
+    # consumer then drops as `dropped_feature_disabled`, so no GPU issue appears:
+    #   * organizations:gpu-crash-symbolication          (producer / teapot gate)
+    #   * organizations:issue-gpu-crash-ingest           (auto: allow_ingest)
+    #   * organizations:issue-gpu-crash-post-process-group (auto)
+    #   * organizations:issue-gpu-crash-visible          (auto: UI visibility)
+    # The last three are auto-registered by the issue platform because
+    # `released=False`; set `released=True` (and drop the symbolication flag)
+    # once GPU crashes ship to everyone.
     released = False
     default_priority = PriorityLevel.HIGH
     # The base GroupType default is Quota(3600, 60, 5) — 5 new groups per

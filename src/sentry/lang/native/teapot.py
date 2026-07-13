@@ -26,6 +26,7 @@ polling. The client therefore skips the task-id / worker-id state that
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any, Protocol
 
@@ -72,6 +73,19 @@ DEFAULT_MAX_ATTEMPTS = 2
 
 # Retry only on transient / bounded failures. Everything else surfaces.
 RETRYABLE_STATUS = (502, 503, 504)
+
+# Exponential backoff between transient retries — an immediate retry rarely
+# helps a briefly-overloaded teapot. Bounded because we retry inside the GPU
+# task's processing deadline (and max-attempts is small).
+RETRY_BACKOFF_SECONDS = 0.5
+RETRY_BACKOFF_MAX_SECONDS = 4.0
+
+
+def _sleep_before_retry(attempt: int, attempts: int) -> None:
+    """Back off before the next attempt; no-op after the final one."""
+    if attempt + 1 >= attempts:
+        return
+    time.sleep(min(RETRY_BACKOFF_SECONDS * (2**attempt), RETRY_BACKOFF_MAX_SECONDS))
 
 
 def _timeout() -> int:
@@ -261,7 +275,8 @@ class TeapotClient:
     ) -> dict[str, Any]:
         last_exc: Exception | None = None
         timeout = _timeout()
-        for attempt in range(_max_attempts()):
+        attempts = _max_attempts()
+        for attempt in range(attempts):
             try:
                 resp = requests.post(
                     url,
@@ -276,6 +291,7 @@ class TeapotClient:
                     "teapot.request_exception",
                     extra={"attempt": attempt, "event_id": self.event_id, "error": str(e)},
                 )
+                _sleep_before_retry(attempt, attempts)
                 continue
 
             if resp.status_code in RETRYABLE_STATUS:
@@ -287,6 +303,7 @@ class TeapotClient:
                         "status": resp.status_code,
                     },
                 )
+                _sleep_before_retry(attempt, attempts)
                 continue
 
             if resp.status_code >= 400:

@@ -139,11 +139,6 @@ def _run(project_id: int, cpu_event_id: str, group_id: int | None) -> None:
         metrics.incr("tasks.gpu_crash.skipped", tags={"reason": "attachment_missing"})
         return
 
-    # Dedupe redelivered tasks just before the expensive, side-effectful work.
-    if not _claim_once(cpu_event_id):
-        metrics.incr("tasks.gpu_crash.skipped", tags={"reason": "already_processed"})
-        return
-
     shader_atts = find_all_shader_debug_eventattachments(project_id, cpu_event_id)
 
     try:
@@ -177,6 +172,16 @@ def _run(project_id: int, cpu_event_id: str, group_id: int | None) -> None:
     cpu_event_data = cpu_event.data if cpu_event is not None else {}
     if cpu_event is None:
         metrics.incr("tasks.gpu_crash.cpu_event_missing")
+
+    # Dedupe redelivered tasks here, right before the side effect. We claim the
+    # key only after a successful decode, so a transient failure above (bad
+    # attachment read, teapot down) leaves the event eligible for a retry on
+    # redelivery — `at_most_once` means there's no automatic retry otherwise.
+    # A concurrent redelivery that beats us to the claim just skips the emit;
+    # its own teapot call is a cheap idempotency-key replay.
+    if not _claim_once(cpu_event_id):
+        metrics.incr("tasks.gpu_crash.skipped", tags={"reason": "already_processed"})
+        return
 
     produced = emit_gpu_crash_occurrence(project, cpu_event_id, cpu_event_data, response)
     metrics.incr(
