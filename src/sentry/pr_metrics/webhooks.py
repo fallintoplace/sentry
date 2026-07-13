@@ -53,13 +53,16 @@ from sentry.pr_metrics.activity_types import (
     CheckSuiteCompletedPayload,
     ClosedPayload,
     CommentCreatedPayload,
+    CommentDeletedPayload,
     ConvertedToDraftPayload,
     DequeuedPayload,
+    EditedPayload,
     EnqueuedPayload,
     LabeledPayload,
     MergedPayload,
     OpenedPayload,
     ReadyForReviewPayload,
+    ReopenedPayload,
     ReviewDismissedPayload,
     ReviewRequestedPayload,
     ReviewRequestRemovedPayload,
@@ -124,6 +127,8 @@ _ACTIVITY_ACTIONS = frozenset(
 # resolved in _write_activity.
 _ACTION_TO_ACTIVITY_TYPE: dict[str, PullRequestActivityType] = {
     "opened": PullRequestActivityType.OPENED,
+    "reopened": PullRequestActivityType.REOPENED,
+    "edited": PullRequestActivityType.EDITED,
     "synchronize": PullRequestActivityType.SYNCHRONIZED,
     "labeled": PullRequestActivityType.LABELED,
     "unlabeled": PullRequestActivityType.UNLABELED,
@@ -138,6 +143,16 @@ _ACTION_TO_ACTIVITY_TYPE: dict[str, PullRequestActivityType] = {
     "enqueued": PullRequestActivityType.ENQUEUED,
     "dequeued": PullRequestActivityType.DEQUEUED,
 }
+
+# Actions captured only on the reduced-document path; the legacy row store never
+# recorded them (reopened/edited were removed as unused, and re-adding them to the
+# legacy path would change its frozen behavior). Gated on the document store.
+_DOC_ONLY_ACTIONS = frozenset({"reopened", "edited"})
+
+# Terminal actions whose event must be recorded even when the PR row already reads
+# terminal / its verdict is claimed (see ``is_activity_tracking_enabled``'s
+# ``for_terminal_event``). "closed" forks into CLOSED/MERGED; both are terminal.
+_TERMINAL_ACTIONS = frozenset({"closed", "reopened"})
 
 
 def handle_attribution(
@@ -511,10 +526,16 @@ def handle_activity(
     integration: RpcIntegration | None = None,
     **kwargs: Any,
 ) -> None:
-    """Record PR lifecycle activity rows from pull_request webhook events."""
+    """Record PR lifecycle activity from pull_request webhook events."""
     pull_request_data = event.get("pull_request")
     action = event.get("action")
-    if not action or action not in _ACTIVITY_ACTIONS:
+    if not action or (action not in _ACTIVITY_ACTIONS and action not in _DOC_ONLY_ACTIONS):
+        return
+
+    # reopened/edited exist only on the document path; skip the whole path —
+    # including PR resolution — when the cutover option is off, so the legacy path
+    # is untouched.
+    if action in _DOC_ONLY_ACTIONS and not options.get(_ACTIVITY_DOCUMENT_OPTION):
         return
 
     pr = _get_pull_request(
@@ -527,11 +548,19 @@ def handle_activity(
     if pr is None:
         return
 
-    if not is_activity_tracking_enabled(organization, pr):
+    use_doc = _use_activity_document(pr)
+    if action in _DOC_ONLY_ACTIONS and not use_doc:
+        # Option is on globally, but this PR is still on the legacy store.
+        return
+
+    # Terminal events (close/merge/reopen) on the document path must be recorded
+    # even if the PR row already reads terminal; other events stop once settled.
+    for_terminal_event = use_doc and action in _TERMINAL_ACTIONS
+    if not is_activity_tracking_enabled(organization, pr, for_terminal_event=for_terminal_event):
         return
 
     webhook_id: str | None = kwargs.get("github_delivery_id")
-    _write_activity(pr, action, pull_request_data or {}, event, webhook_id)
+    _write_activity(pr, action, pull_request_data or {}, event, webhook_id, use_doc)
 
 
 def handle_comment(
@@ -543,9 +572,19 @@ def handle_comment(
     integration: RpcIntegration | None = None,
     **kwargs: Any,
 ) -> None:
-    """Record PR comment activity from issue_comment webhook events."""
+    """Record PR comment activity from issue_comment webhook events.
+
+    ``created`` folds the commenter into the document's participants (or writes a
+    legacy COMMENT_CREATED row); ``deleted`` records a discrete comment_deleted
+    entry — document path only, human senders only.
+    """
     action = event.get("action")
-    if action != "created":
+    if action not in ("created", "deleted"):
+        return
+
+    # comment_deleted is a document-path-only capture; skip it before resolving a PR
+    # whenever the cutover option is globally off, leaving the legacy path untouched.
+    if action == "deleted" and not options.get(_ACTIVITY_DOCUMENT_OPTION):
         return
 
     if not is_activity_tracking_enabled(organization):
@@ -576,18 +615,21 @@ def handle_comment(
     if not is_activity_tracking_enabled(organization, pr):
         return
 
+    if not webhook_id:
+        return
+
     sender = event.get("sender") or {}
     comment = event.get("comment") or {}
+
+    if action == "deleted":
+        _record_comment_deletion(pr, webhook_id, sender, is_review=False)
+        return
 
     payload_obj = CommentCreatedPayload(
         sender_login=sender.get("login", ""),
         sender_type=sender.get("type", ""),
         author_association=comment.get("author_association", "NONE"),
     )
-
-    if not webhook_id:
-        return
-
     _record_comment_event(pr, webhook_id, asdict(payload_obj))
 
 
@@ -652,7 +694,7 @@ def handle_review(
     webhook_id: str | None = kwargs.get("github_delivery_id")
     if not webhook_id:
         return
-    _record_entry_event(pr, webhook_id, event_type, payload, event)
+    _record_entry_event(pr, webhook_id, event_type, payload, event, _use_activity_document(pr))
 
 
 def handle_review_comment(
@@ -664,9 +706,17 @@ def handle_review_comment(
     integration: RpcIntegration | None = None,
     **kwargs: Any,
 ) -> None:
-    """Record inline PR review comments (pull_request_review_comment events)."""
+    """Record inline PR review comments (pull_request_review_comment events).
+
+    ``created`` folds the commenter into participants (or writes a legacy
+    COMMENT_CREATED row); ``deleted`` records a discrete comment_deleted entry —
+    document path only, human senders only.
+    """
     action = event.get("action")
-    if action != "created":
+    if action not in ("created", "deleted"):
+        return
+
+    if action == "deleted" and not options.get(_ACTIVITY_DOCUMENT_OPTION):
         return
 
     if not is_activity_tracking_enabled(organization):
@@ -685,8 +735,16 @@ def handle_review_comment(
     if not is_activity_tracking_enabled(organization, pr):
         return
 
+    webhook_id: str | None = kwargs.get("github_delivery_id")
+    if not webhook_id:
+        return
+
     comment = event.get("comment") or {}
     sender = event.get("sender") or {}
+
+    if action == "deleted":
+        _record_comment_deletion(pr, webhook_id, sender, is_review=True)
+        return
 
     payload_obj = CommentCreatedPayload(
         sender_login=sender.get("login", ""),
@@ -695,10 +753,6 @@ def handle_review_comment(
         is_review=True,
         review_id=comment.get("pull_request_review_id"),
     )
-
-    webhook_id: str | None = kwargs.get("github_delivery_id")
-    if not webhook_id:
-        return
     _record_comment_event(pr, webhook_id, asdict(payload_obj))
 
 
@@ -753,7 +807,7 @@ def handle_review_thread(
     webhook_id: str | None = kwargs.get("github_delivery_id")
     if not webhook_id:
         return
-    _record_entry_event(pr, webhook_id, event_type, payload, event)
+    _record_entry_event(pr, webhook_id, event_type, payload, event, _use_activity_document(pr))
 
 
 def handle_check_suite(
@@ -800,6 +854,7 @@ def handle_check_suite(
                 PullRequestActivityType.CHECK_SUITE_COMPLETED,
                 payload,
                 provider_ts=check_suite.get("updated_at"),
+                head_sha=check_suite.get("head_sha"),
             )
 
 
@@ -846,6 +901,7 @@ def handle_check_run(
                 PullRequestActivityType.CHECK_RUN_COMPLETED,
                 payload,
                 provider_ts=check_run.get("completed_at"),
+                head_sha=check_run.get("head_sha"),
             )
 
 
@@ -1318,9 +1374,10 @@ def _record_entry_event(
     event_type: PullRequestActivityType,
     payload: dict[str, Any],
     event: Mapping[str, Any],
+    use_doc: bool,
 ) -> None:
     """Route a lifecycle entry to the document or a legacy row per this PR's store."""
-    if _use_activity_document(pr):
+    if use_doc:
         _fold_into_activity_doc(
             pr,
             event_type=event_type,
@@ -1350,24 +1407,57 @@ def _record_comment_event(pr: PullRequest, webhook_id: str, payload: dict[str, A
         _write_activity_row(pr, webhook_id, PullRequestActivityType.COMMENT_CREATED, payload)
 
 
+def _record_comment_deletion(
+    pr: PullRequest, webhook_id: str, sender: Mapping[str, Any], *, is_review: bool
+) -> None:
+    """Record a human comment deletion as a document-path entry.
+
+    Captured only on the document path and only from human senders: sticky-comment
+    bots delete+recreate per push, and that churn is exactly the noise the
+    comment-fold design removes. Unlike a creation (folded into participants), a
+    deletion is stored as a discrete entry — it's the only surviving record of a
+    removed comment, which is gone from the SCM by judge time.
+    """
+    if not _use_activity_document(pr):
+        return
+    if sender.get("type") == "Bot":
+        return
+    payload = asdict(
+        CommentDeletedPayload(
+            sender_login=sender.get("login", ""),
+            sender_type=sender.get("type", ""),
+            is_review=is_review,
+        )
+    )
+    _fold_into_activity_doc(
+        pr,
+        event_type=PullRequestActivityType.COMMENT_DELETED,
+        payload=payload,
+        webhook_id=webhook_id,
+    )
+
+
 def _record_check_event(
     pr: PullRequest,
     webhook_id: str,
     event_type: PullRequestActivityType,
     payload: dict[str, Any],
     provider_ts: str | None,
+    head_sha: str | None,
 ) -> None:
     """Route a check completion to the document rollup or a legacy row.
 
     ``provider_ts`` is the check's own timestamp (a run's ``completed_at`` or a
-    suite's ``updated_at``) that the monotone rollup uses for its latest-wins and
-    ``first_failure_at`` comparisons.
+    suite's ``updated_at``) driving the rollup's latest-wins and ``first_failure_at``
+    comparisons; ``head_sha`` keys the rollup's per-push groups. Both reach the
+    reducer only on the document path — the legacy row's payload is left exactly as
+    before.
     """
     if _use_activity_document(pr):
         _fold_into_activity_doc(
             pr,
             event_type=event_type,
-            payload=payload,
+            payload={**payload, "head_sha": head_sha or ""},
             webhook_id=webhook_id,
             provider_ts=provider_ts,
         )
@@ -1399,6 +1489,7 @@ def _write_activity(
     pull_request: Mapping[str, Any],
     event: Mapping[str, Any],
     webhook_id: str | None,
+    use_doc: bool,
 ) -> None:
     if not webhook_id:
         # Without a delivery ID idempotency cannot be guaranteed — skip.
@@ -1418,14 +1509,15 @@ def _write_activity(
             return
         event_type = mapped
 
-    payload = _build_activity_payload(action, pull_request, event)
-    _record_entry_event(pr, webhook_id, event_type, payload, event)
+    payload = _build_activity_payload(action, pull_request, event, use_doc)
+    _record_entry_event(pr, webhook_id, event_type, payload, event, use_doc)
 
 
 def _build_activity_payload(
     action: str,
     pull_request: Mapping[str, Any],
     event: Mapping[str, Any],
+    use_doc: bool,
 ) -> dict[str, Any]:
     head = pull_request.get("head") or {}
     base = pull_request.get("base") or {}
@@ -1435,6 +1527,11 @@ def _build_activity_payload(
         sender_login=sender.get("login", ""),
         sender_type=sender.get("type", ""),
     )
+    # The auto-merge / merge-queue payloads only carry a sender on the document
+    # path: adding it to the legacy row would fold these actors into that path's
+    # participants_count, changing its frozen behavior. On the legacy path the
+    # fields stay at their empty defaults (excluded from participants).
+    queue_sender_kw = sender_kw if use_doc else {}
 
     match action:
         case "opened":
@@ -1461,6 +1558,13 @@ def _build_activity_payload(
             if pull_request.get("merged"):
                 return asdict(MergedPayload(**sender_kw))
             return asdict(ClosedPayload(**sender_kw))
+        case "reopened":
+            return asdict(ReopenedPayload(**sender_kw))
+        case "edited":
+            # Field NAMES only (keys of the webhook ``changes`` object); the values
+            # are the old title/body text, which the structural-only posture drops.
+            changed_fields = sorted((event.get("changes") or {}).keys())
+            return asdict(EditedPayload(**sender_kw, changed_fields=changed_fields))
         case "labeled":
             label = event.get("label") or {}
             return asdict(LabeledPayload(**sender_kw, label_name=(label.get("name") or "")))
@@ -1492,13 +1596,15 @@ def _build_activity_payload(
         case "auto_merge_enabled":
             auto_merge = pull_request.get("auto_merge") or {}
             return asdict(
-                AutoMergeEnabledPayload(merge_method=auto_merge.get("merge_method") or "")
+                AutoMergeEnabledPayload(
+                    **queue_sender_kw, merge_method=auto_merge.get("merge_method") or ""
+                )
             )
         case "auto_merge_disabled":
-            return asdict(AutoMergeDisabledPayload())
+            return asdict(AutoMergeDisabledPayload(**queue_sender_kw))
         case "enqueued":
-            return asdict(EnqueuedPayload())
+            return asdict(EnqueuedPayload(**queue_sender_kw))
         case "dequeued":
-            return asdict(DequeuedPayload(reason=event.get("reason") or ""))
+            return asdict(DequeuedPayload(**queue_sender_kw, reason=event.get("reason") or ""))
         case _:
             raise ValueError(f"No payload builder for action {action!r}")
