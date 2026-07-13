@@ -109,8 +109,7 @@ def _build_flat_gpu_context(response: Mapping[str, Any]) -> dict[str, Any]:
     Sentry's context renderer surfaces top-level scalars directly but
     collapses nested objects under ``> { N items }``. Flattening the
     fault / gpu_state into scalar fields means every useful value shows
-    up without the user having to expand. The full nested blobs live on
-    ``contexts.gpu_crash_raw`` for deep debugging.
+    up without the user having to expand.
 
     Shared between ``_merge_gpu_response`` (enriches the CPU event) and
     ``_produce_gpu_occurrence`` (builds the dedicated GPU event) so both
@@ -162,19 +161,6 @@ def _build_flat_gpu_context(response: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in flat.items() if v is not None}
 
 
-def _build_gpu_raw_context(response: Mapping[str, Any]) -> dict[str, Any]:
-    """Keep the full nested teapot response for deep debugging on the event."""
-
-    return {
-        "type": "default",
-        "fault": response.get("fault") or {},
-        "gpu_state": response.get("gpu_state") or {},
-        "shader_context": response.get("shader_context") or {},
-        "missing_difs": response.get("missing_difs") or [],
-        "markers": response.get("markers") or [],
-    }
-
-
 def _merge_gpu_response(data: Any, response: Mapping[str, Any]) -> None:
     """Write teapot's response into the event's gpu_crash context.
 
@@ -200,7 +186,6 @@ def _merge_gpu_response(data: Any, response: Mapping[str, Any]) -> None:
         return
 
     set_path(data, "contexts", "gpu_crash", value=_build_flat_gpu_context(response))
-    set_path(data, "contexts", "gpu_crash_raw", value=_build_gpu_raw_context(response))
 
     # Private channel: picked up by the occurrence producer. Not
     # persisted into Snuba / not shown in the UI.
@@ -414,7 +399,6 @@ def _produce_gpu_occurrence(
 
     gpu_contexts: dict[str, Any] = {
         "gpu_crash": _build_flat_gpu_context(response),
-        "gpu_crash_raw": _build_gpu_raw_context(response),
     }
     if trace_context:
         gpu_contexts["trace"] = trace_context

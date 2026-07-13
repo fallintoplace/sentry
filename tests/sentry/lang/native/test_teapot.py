@@ -148,11 +148,8 @@ def test_merge_gpu_response_writes_context() -> None:
     assert "shader_context" not in ctx
     assert ctx["missing_dif_count"] == 0
 
-    # Raw nested blobs still available under gpu_crash_raw (hidden in UI).
-    raw = data["contexts"]["gpu_crash_raw"]
-    assert raw["type"] == "default"
-    assert raw["fault"]["type"] == "PageFault"
-    assert raw["gpu_state"]["device_name"] == "Test GPU"
+    # Only the flattened gpu_crash context is written — no raw nested blob.
+    assert "gpu_crash_raw" not in data["contexts"]
     # Frames go to the private channel, not user-visible context.
     assert data["_gpu_crash_private"]["frames"] == [{"function": "main", "module": "abc123"}]
 
