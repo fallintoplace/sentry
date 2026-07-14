@@ -106,7 +106,7 @@ def symbolicate_gpu_crash(
 
 
 def _run(project_id: int, cpu_event_id: str, group_id: int | None) -> None:
-    from sentry.lang.native.gpu import emit_gpu_crash_occurrence
+    from sentry.lang.native.gpu import emit_gpu_crash_event
     from sentry.lang.native.teapot import submit_to_teapot
     from sentry.lang.native.utils import (
         find_all_shader_debug_eventattachments,
@@ -177,13 +177,14 @@ def _run(project_id: int, cpu_event_id: str, group_id: int | None) -> None:
     # key only after a successful decode, so a transient failure above (bad
     # attachment read, teapot down) leaves the event eligible for a retry on
     # redelivery — `at_most_once` means there's no automatic retry otherwise.
-    # A concurrent redelivery that beats us to the claim just skips the emit;
-    # its own teapot call is a cheap idempotency-key replay.
+    # A concurrent redelivery that beats us to the claim just skips the save;
+    # its own teapot call is a cheap idempotency-key replay. This is also what
+    # keeps us from saving (and billing) a duplicate GPU error event.
     if not _claim_once(cpu_event_id):
         metrics.incr("tasks.gpu_crash.skipped", tags={"reason": "already_processed"})
         return
 
-    produced = emit_gpu_crash_occurrence(project, cpu_event_id, cpu_event_data, response)
+    produced = emit_gpu_crash_event(project, cpu_event_id, cpu_event_data, response)
     metrics.incr(
         "tasks.gpu_crash.completed",
         tags={

@@ -14,7 +14,7 @@ _RUN = "sentry.tasks.gpu_crash._run"
 FIND_DUMP = "sentry.lang.native.utils.find_gpu_crash_dump_eventattachment"
 FIND_SHADERS = "sentry.lang.native.utils.find_all_shader_debug_eventattachments"
 SUBMIT = "sentry.lang.native.teapot.submit_to_teapot"
-EMIT = "sentry.lang.native.gpu.emit_gpu_crash_occurrence"
+EMIT = "sentry.lang.native.gpu.emit_gpu_crash_event"
 GET_EVENT = "sentry.services.eventstore.backend.get_event_by_id"
 
 
