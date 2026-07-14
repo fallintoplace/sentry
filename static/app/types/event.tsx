@@ -781,6 +781,7 @@ interface EventBase {
   dateCreated?: string;
   device?: Record<string, any>;
   endTimestamp?: number;
+  formatted?: {content: string; format: string};
   groupID?: string;
   groupingConfig?: {
     enhancements: string;
@@ -802,7 +803,7 @@ interface EventBase {
     version: string | null;
   } | null;
   sdkUpdates?: SDKUpdatesSuggestion[];
-  userReport?: UserReport | null;
+  userReport?: UserReport | null; // add to eventBase so it knows it can receive formatted
 }
 
 interface TraceEventContexts extends EventContexts {
