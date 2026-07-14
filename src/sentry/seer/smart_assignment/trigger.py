@@ -2,15 +2,17 @@
 
 `maybe_trigger_smart_assignment` is the single gated entrypoint: it checks the
 feature flag, dedups to one prediction per issue (so a run is only dispatched the
-first time), and enforces per-org and global daily dispatch caps. It takes the
-triggering `ActivityType` directly (rather than condensing it into a bespoke enum)
-so we keep the exact provenance in metrics and the run mirror. Today every trigger
-is an activity; a future non-activity source would widen this parameter.
+first time), enforces per-org and global daily dispatch caps, and records the
+observed ground truth (via `scoring.record_ground_truth`) whether or not a new run
+was dispatched. It takes the triggering `ActivityType` directly (rather than
+condensing it into a bespoke enum) so we keep the exact provenance in metrics and the
+run mirror. Today every trigger is an activity; a future non-activity source would
+widen this parameter.
 
 There is no dedicated result table: Seer stores the run/verdict (queryable per issue
 via `category_value=<group_id>`) and the run's Sentry-side mirror (`SeerAgentRun`,
-source="smart_assignment") is the dedup key. The triggering activity is stamped with
-a pointer back to the run it kicked off.
+source="smart_assignment") is both the dedup key and the scoring bookkeeping (see
+`scoring`). The triggering activity is stamped with a pointer back to the run.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from sentry.seer.smart_assignment.models import (
     RESOLUTION_ACTIVITIES,
     SmartAssignmentPayload,
 )
+from sentry.seer.smart_assignment.scoring import record_ground_truth
 from sentry.types.activity import ActivityType
 from sentry.utils import metrics
 
@@ -46,15 +49,17 @@ def maybe_trigger_smart_assignment(
     activity_type: ActivityType,
     activity: Activity | None = None,
 ) -> None:
-    """Gate + dispatch a prediction for `group`.
+    """Gate + dispatch a prediction for `group`, and record ground truth.
 
     Dispatches a Seer run the first time (deduped to one run per group, and subject
-    to per-org / global daily caps). `activity_type` is what triggered us (a Seer AI
-    step starting, an assignment, or a resolution); `activity` is the triggering
-    activity, stamped with a pointer to the run it kicked off. No-op unless the org
-    is flagged. Automatic resolutions (no acting user, e.g. resolved by age) are
-    skipped entirely -- we only treat a resolution as signal when a human resolved
-    the issue, since then they probably should have been the assignee.
+    to per-org / global daily caps); records the observed ground truth for assignment
+    and resolution activities either way. Note the caps only gate new dispatches --
+    ground truth is still recorded for already-predicted issues. `activity_type` is
+    what triggered us; `activity` is the triggering activity (stamped with a pointer
+    to the run, and for a resolution supplies the resolving user). No-op unless the
+    org is flagged. Automatic resolutions (no acting user, e.g. resolved by age) are
+    skipped entirely -- we only treat a resolution as signal when a human resolved the
+    issue, since then they probably should have been the assignee.
     """
     organization = group.organization
 
@@ -73,6 +78,8 @@ def maybe_trigger_smart_assignment(
     if not _already_predicted(group):
         if not _dispatch_rate_limited(organization):
             _dispatch(group, activity_type, activity)
+
+    record_ground_truth(group, activity_type, activity)
 
 
 def _already_predicted(group: Group) -> bool:
