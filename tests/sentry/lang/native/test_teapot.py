@@ -19,11 +19,11 @@ import pytest
 import requests
 
 from sentry.lang.native.gpu import (
+    GPU_CRASH_DUMP_ATTACHMENT_TYPE,
     _build_gpu_error_event,
     _normalize_gpu_frames,
     emit_gpu_crash_event,
 )
-from sentry.lang.native.processing import GPU_CRASH_DUMP_ATTACHMENT_TYPE
 from sentry.lang.native.teapot import (
     TeapotClient,
     TeapotUnavailable,

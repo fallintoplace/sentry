@@ -1601,15 +1601,9 @@ def process_siem_security_logging(job: PostProcessJob) -> None:
 
 
 def process_gpu_crash_dump_async(job: PostProcessJob) -> None:
-    """Schedule isolated GPU crash dump symbolication for native events that
-    carry a ``.nv-gpudmp`` attachment.
-
-    This only *schedules* the work; the actual teapot call + GPU issue
-    production runs in the isolated ``gpu.crash_dump`` task (see
-    ``sentry/tasks/gpu_crash.py``). Scheduling is best-effort and fully wrapped:
-    it can never affect post-processing of the primary (CPU) issue. The
-    ``run_post_process_job`` loop also guards each step, so this is defense in
-    depth.
+    """Schedule isolated GPU crash symbolication for native events with a
+    ``.nv-gpudmp`` attachment. Only schedules — the decode + event save runs in
+    the ``gpu.crash_dump`` task. Best-effort: can't affect the primary issue.
     """
     if job["is_reprocessed"]:
         return
@@ -1621,26 +1615,19 @@ def process_gpu_crash_dump_async(job: PostProcessJob) -> None:
 
     event = job["event"]
 
-    # Cheap, in-memory platform gate first, so non-native events (the
-    # overwhelming majority) bail out for free. We cannot use the event's
-    # `_attachments` list here: `save_event_attachments` pops it before
-    # post-processing (see `store.py` `data.pop("_attachments")`). So for
-    # native events we look the dump up durably in `EventAttachment` — the
-    # ERROR pipeline already queries that table (`update_existing_attachments`).
+    # Can't use the event's `_attachments` (save pops it before post-process), so
+    # look the dump up durably in `EventAttachment` after the cheap platform gate.
     if not is_native_platform(event.platform):
         return
     if find_gpu_crash_dump_eventattachment(event.project_id, event.event_id) is None:
         return
 
-    # Count every GPU crash dump that reaches us, regardless of whether we go on
-    # to process it (flag off / killed / sampled out). This is the "how many
-    # .nv-gpudmp are arriving right now" signal, decoupled from teapot rollout.
+    # Count arrivals regardless of whether we process them (flag/kill/sample).
     metrics.incr("gpu.crash_dump.detected", tags={"platform": event.platform})
 
     organization = event.project.organization
     if not features.has("organizations:gpu-crash-symbolication", organization):
         return
-    # Global kill switch + load/rollout dial, both honored before we enqueue.
     if not options.get("teapot.enabled"):
         return
     if not in_random_rollout("teapot.crash-dump.sample-rate"):
@@ -1660,7 +1647,6 @@ def process_gpu_crash_dump_async(job: PostProcessJob) -> None:
         )
         metrics.incr("tasks.gpu_crash.scheduled")
     except Exception:
-        # Enqueue must never break the primary issue's post-processing.
         metrics.incr("tasks.gpu_crash.schedule_error")
         logger.exception("Failed to schedule GPU crash dump task")
 

@@ -34,7 +34,7 @@ def _completed_response() -> dict[str, Any]:
 
 
 @django_db_all
-def test_task_happy_path_produces_occurrence(default_project: Project) -> None:
+def test_task_happy_path_saves_event(default_project: Project) -> None:
     with (
         override_options({"teapot.enabled": True}),
         Feature("organizations:gpu-crash-symbolication"),
@@ -118,7 +118,7 @@ def test_task_once_guard_dedupes(default_project: Project) -> None:
         symbolicate_gpu_crash(project_id=default_project.id, cpu_event_id="evt-once")
 
     # The once-guard is claimed just before emit (only a successful decode
-    # claims it), so the second delivery produces no duplicate occurrence. Its
+    # claims it), so the second delivery saves no duplicate event. Its
     # teapot call would be a cheap idempotency-key replay in production.
     assert emit.call_count == 1
 

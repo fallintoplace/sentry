@@ -42,12 +42,6 @@ MINIDUMP_ATTACHMENT_TYPE = "event.minidump"
 # Attachment type used for Apple Crash Reports
 APPLECRASHREPORT_ATTACHMENT_TYPE = "event.applecrashreport"
 
-# The GPU crash attachment type lives in sentry.lang.native.gpu; re-export it
-# here so the attachment finders in utils.py can import it without a cycle.
-from sentry.lang.native.gpu import (  # noqa: E402
-    GPU_CRASH_DUMP_ATTACHMENT_TYPE as GPU_CRASH_DUMP_ATTACHMENT_TYPE,
-)
-
 # Rules for rewriting the debug file of the first module
 # in an Electron minidump.
 #

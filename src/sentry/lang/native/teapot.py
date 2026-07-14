@@ -1,26 +1,12 @@
 """HTTP client for the teapot GPU crash dump symbolication service.
 
-Teapot is a sibling to Symbolicator: it decodes vendor-specific GPU crash
-dumps (NVIDIA Aftermath `.nv-gpudmp` first, PIX / AMD RGP later) and returns
-a structured JSON result that Sentry folds into the event.
+Teapot is a sibling to Symbolicator that decodes NVIDIA Aftermath `.nv-gpudmp`
+dumps. It's synchronous (one request/response, no polling) with a bounded retry
+on transient 5xx. Two wire formats, picked per request:
 
-Two wire formats, picked per-request based on attachment storage:
-
-* **JSON + storage_url + token** (preferred): when every attachment has a
-  `stored_id` set, we mint a short-lived objectstore token per attachment
-  and POST a JSON body with `storage_url` + `storage_token` references.
-  Teapot fetches the bytes from objectstore directly. No bytes pass
-  through Sentry workers. Mirrors `Symbolicator.process_minidump`'s
-  objectstore path at `sentry/lang/native/symbolicator.py:201-221`.
-
-* **multipart with raw bytes** (fallback): when objectstore isn't in the
-  loop (self-hosted Sentry installs without the objectstore service, or
-  attachments still on the legacy V1 path) we load bytes via
-  `TeapotAttachment.load_data` and POST them as multipart fields.
-
-Unlike Symbolicator, teapot is synchronous — one request, one response, no
-polling. The client therefore skips the task-id / worker-id state that
-`Symbolicator` carries and just runs a bounded retry on transient 5xx.
+* JSON + storage_url + token when every attachment is in objectstore (bytes
+  stay in objectstore, mirroring Symbolicator's minidump path).
+* multipart raw bytes otherwise (legacy V1 storage / self-hosted).
 """
 
 from __future__ import annotations
@@ -42,11 +28,10 @@ logger = logging.getLogger(__name__)
 
 
 class TeapotAttachment(Protocol):
-    """The subset of the ``CachedAttachment`` surface the teapot client needs.
+    """The ``CachedAttachment`` surface the client needs, as a structural type.
 
-    Structural typing lets callers pass a real ``CachedAttachment``, the
-    ``EventAttachment``-backed adapter from the async task, or a test double —
-    anything exposing a ``stored_id`` and byte loader — without subclassing.
+    Lets callers pass a real ``CachedAttachment``, the ``EventAttachment``
+    adapter from the async task, or a test double.
     """
 
     stored_id: str | None
@@ -55,28 +40,19 @@ class TeapotAttachment(Protocol):
 
 
 def _require_stored_id(att: TeapotAttachment) -> str:
-    """Return the attachment's ``stored_id``, asserting it's set.
-
-    Only called on the JSON-by-reference path, which ``_all_stored`` gates on
-    every attachment having a ``stored_id`` — this just narrows ``str | None``
-    to ``str`` for the type checker.
-    """
+    # Only the JSON path calls this, gated on `_all_stored`; narrows str | None.
     assert att.stored_id is not None
     return att.stored_id
 
 
-# Fallbacks if the options aren't available for some reason. The live values
-# come from `teapot.timeout-seconds` / `teapot.max-attempts` so ops can tune
-# them at runtime without a deploy (see `_timeout` / `_max_attempts`).
+# Fallbacks; live values come from the `teapot.timeout-seconds` /
+# `teapot.max-attempts` options (see `_timeout` / `_max_attempts`).
 DEFAULT_TIMEOUT = 25
 DEFAULT_MAX_ATTEMPTS = 2
 
-# Retry only on transient / bounded failures. Everything else surfaces.
 RETRYABLE_STATUS = (502, 503, 504)
 
-# Exponential backoff between transient retries — an immediate retry rarely
-# helps a briefly-overloaded teapot. Bounded because we retry inside the GPU
-# task's processing deadline (and max-attempts is small).
+# Bounded exponential backoff between transient retries.
 RETRY_BACKOFF_SECONDS = 0.5
 RETRY_BACKOFF_MAX_SECONDS = 4.0
 
@@ -121,15 +97,7 @@ def _resolve_url() -> str | None:
 def _all_stored(
     dump: TeapotAttachment, shader_debug_info: Iterable[tuple[str, TeapotAttachment]]
 ) -> bool:
-    """True iff every input attachment is already in objectstore.
-
-    We can only take the JSON+storage_url path when ALL attachments have
-    a `stored_id` — teapot can't mix-and-match wire formats per
-    attachment. Mixed state is rare in practice (Sentry's attachment
-    ingest writes everything to the same backend per project) but if
-    it happens we fall through to multipart for safety.
-    """
-
+    # JSON path requires every attachment in objectstore; else fall to multipart.
     if not dump.stored_id:
         return False
     return all(att.stored_id for _, att in shader_debug_info)
@@ -138,19 +106,9 @@ def _all_stored(
 class TeapotClient:
     """Synchronous HTTP client for POST /symbolicate.
 
-    Usage:
-        client = TeapotClient(project=project, event_id=event_id)
-        response = client.symbolicate(dump_attachment, shader_debug_info)
-
-    `shader_debug_info` is a list of (uid, attachment) pairs — typically
-    one per active shader involved in the crash, sourced via
-    `find_all_shader_debug_attachments(data)`. Passing an empty list is
-    fine for crashes where the customer's SDK didn't (or couldn't) ship
-    `.nvdbg` bytes; teapot decodes the dump without source mapping.
-
-    Raises `TeapotUnavailable` on network errors or exhausted 5xx retries.
-    Callers should treat that as "skip enrichment" — never fatal to the
-    primary event.
+    `shader_debug_info` is a list of (uid, attachment) pairs (one per shader);
+    an empty list is fine. Raises `TeapotUnavailable` on network errors or
+    exhausted 5xx retries — callers treat that as "skip", never fatal.
     """
 
     def __init__(self, project: Any, event_id: str) -> None:
@@ -171,10 +129,8 @@ class TeapotClient:
         headers = {
             "X-Teapot-Version": "1",
             "X-Request-Id": self.event_id,
-            # event_id is a natural idempotency key: one decode per event.
-            # Teapot replays a cached 200 (never a 5xx) for a repeated key,
-            # so a retried symbolication task skips the re-decode + the
-            # objectstore round-trip entirely. See teapot's IdempotencyCache.
+            # event_id as idempotency key → teapot replays a cached 200 for a
+            # retried task instead of re-decoding.
             "Idempotency-Key": self.event_id,
         }
 
@@ -189,14 +145,7 @@ class TeapotClient:
         dump: TeapotAttachment,
         shader_debug_info: Sequence[tuple[str, TeapotAttachment]],
     ) -> dict[str, Any]:
-        """Pass attachments to teapot by reference — bytes stay in objectstore.
-
-        Same shape Symbolicator uses on `POST /symbolicate-any`: a single
-        per-attachment token minted from a single objectstore session, so
-        all GETs share the same auth window. Token lifetime is short
-        (objectstore enforces it server-side); we mint within the same
-        request as the POST.
-        """
+        """Pass attachments to teapot by reference — bytes stay in objectstore."""
 
         session = get_attachments_session(self.project.organization_id, self.project.id)
         dump_url = get_symbolicator_url(session, _require_stored_id(dump))
@@ -206,8 +155,6 @@ class TeapotClient:
             "organization_id": str(self.project.organization_id),
             "dump": {
                 "storage_url": dump_url,
-                # Token minted just before the request so its lifetime
-                # window covers teapot's fetch round-trip.
                 "storage_token": session.mint_token(),
             },
             "shader_debug_info": [
@@ -230,23 +177,14 @@ class TeapotClient:
         dump: TeapotAttachment,
         shader_debug_info: Sequence[tuple[str, TeapotAttachment]],
     ) -> dict[str, Any]:
-        """Fallback: load bytes via the attachment cache and POST them inline.
-
-        Used when any attachment lacks `stored_id` (legacy V1 storage,
-        self-hosted Sentry without objectstore, or pre-rollout). Worker
-        memory pressure is real here — one big crash can carry several
-        hundred KB of `.nvdbg` payloads — but it's the only correct
-        wire format until everything's on objectstore.
-        """
+        """Fallback: load bytes and POST them inline when not all in objectstore."""
 
         data: dict[str, str] = {
             "event_id": self.event_id,
             "project_id": str(self.project.id),
             "organization_id": str(self.project.organization_id),
         }
-        # `requests` accepts a list-of-tuples for `files` to allow multiple
-        # entries with different field names; that's the only way to send
-        # N `nv_shader_debug.<uid>` fields per request.
+        # list-of-tuples lets us send N `nv_shader_debug.<uid>` fields per request.
         files: list[tuple[str, tuple[str, bytes, str]]] = [
             (
                 "upload_file",
@@ -334,12 +272,7 @@ def submit_to_teapot(
     dump: TeapotAttachment,
     shader_debug_info: Sequence[tuple[str, TeapotAttachment]] | None = None,
 ) -> dict[str, Any] | None:
-    """Best-effort teapot invocation. Returns None on any failure.
-
-    Callers must treat a `None` return as "no enrichment available" and
-    proceed as if the dump were never processed. Teapot failures never fail
-    the primary event.
-    """
+    """Best-effort teapot invocation. Returns None on any failure."""
 
     try:
         client = TeapotClient(project=project, event_id=event_id)

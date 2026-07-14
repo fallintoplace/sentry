@@ -1,21 +1,9 @@
 """GPU crash dump handling — teapot response → synthetic native error event.
 
-Self-contained module that owns everything specific to the GPU crash flow:
-
-* attachment-type detection (`find_gpu_crash_dump_attachment` +
-  `find_all_shader_debug_attachments` in utils)
-* the HTTP call-out to teapot (in `teapot.py`)
-* building a standalone native ERROR event from teapot's decode and saving it
-  via `EventManager.save`, so the GPU crash becomes its own error issue —
-  grouped by teapot's fingerprint, trace-connected to the CPU crash, and billed
-  like any error event.
-
-The GPU event is a sibling of the CPU crash, not an enrichment of it: it's a
-fresh error event with the shader stacktrace, so it groups and renders on its
-own while sharing the CPU event's `contexts.trace.trace_id`.
-
-`processing.py` re-exports `GPU_CRASH_DUMP_ATTACHMENT_TYPE` for the attachment
-finders in `utils.py`.
+Builds a standalone native ERROR event from teapot's decode and saves it via
+`EventManager.save`, so the GPU crash becomes its own error issue: grouped by
+teapot's fingerprint, trace-connected to the CPU crash, and billed like any
+error event. It's a sibling of the CPU crash, not an enrichment of it.
 """
 
 from __future__ import annotations
@@ -30,8 +18,7 @@ from sentry.utils import metrics
 
 logger = logging.getLogger(__name__)
 
-# Attachment type used for NVIDIA Aftermath GPU crash dumps. Processed by
-# teapot (sibling service to Symbolicator).
+# NVIDIA Aftermath GPU crash dump attachment, decoded by teapot.
 GPU_CRASH_DUMP_ATTACHMENT_TYPE = "event.nv_gpudmp"
 
 
@@ -46,18 +33,9 @@ def emit_gpu_crash_event(
 ) -> bool:
     """Save a standalone native ERROR event for the GPU crash.
 
-    Public entry point for the async GPU task (``sentry.tasks.gpu_crash``).
-    Builds an error event from teapot's decode and persists it via
-    ``EventManager.save`` — so the GPU crash becomes its own error issue,
-    grouped by teapot's fingerprint and trace-connected to the CPU crash, and
-    consumes error quota like any ingested event. (That's bounded: a GPU event
-    only exists because a CPU error was already ingested, so at worst it doubles
-    an already-billed native crash.)
-
-    ``cpu_event_data`` is the saved CPU event's data — used only to source the
-    trace id, tags, release, environment, and sdk. Returns True iff an event was
-    saved. ``failed``/unknown statuses are a no-op: teapot couldn't decode, so
-    there's no useful fingerprint. May raise — the task wraps this.
+    Entry point for the async GPU task. Returns True iff an event was saved;
+    ``failed``/unknown statuses are a no-op. May raise — the task wraps this.
+    ``cpu_event_data`` is only read for the trace id, tags, release, env, sdk.
     """
     from sentry.event_manager import EventManager
 
@@ -81,12 +59,10 @@ def emit_gpu_crash_event(
 
 
 def _build_flat_gpu_context(response: Mapping[str, Any]) -> dict[str, Any]:
-    """Flatten teapot's response into a UI-friendly ``contexts.gpu_crash`` dict.
+    """Flatten teapot's response into a ``contexts.gpu_crash`` dict.
 
-    Sentry's context renderer surfaces top-level scalars directly but
-    collapses nested objects under ``> { N items }``. Flattening the
-    fault / gpu_state into scalar fields means every useful value shows
-    up without the user having to expand.
+    Top-level scalars render inline in the context card; nested objects would
+    collapse behind ``> { N items }``, so we flatten fault / gpu_state out.
     """
 
     fault = response.get("fault") or {}
@@ -141,12 +117,9 @@ def _build_gpu_error_event(
 ) -> dict[str, Any]:
     """Assemble the raw native ERROR event payload for a decoded GPU crash.
 
-    Grouping is delegated to teapot: the `fingerprint` array is used verbatim as
-    the event fingerprint, so GPU crashes group independently of the CPU crash
-    (and stay stable across crash shapes — e.g. all page faults on
-    `StreamingTextureAtlas` group together regardless of randomised VA). The
-    exception `type`/`value` drive the issue title; the CPU event's trace
-    context links the two issues in the trace view.
+    The fingerprint is teapot's, verbatim, so GPU crashes group independently of
+    the CPU crash and stay stable across randomised fault addresses. The
+    exception type/value drive the title; the CPU trace context links the two.
     """
 
     fault = response.get("fault") or {}
@@ -160,7 +133,6 @@ def _build_gpu_error_event(
     if not fingerprint:
         fingerprint = ["gpu", category]
 
-    # Exception drives the issue title; the fingerprint above drives grouping.
     exc_type = response.get("title") or f"GPU crash ({category})"
     subtitle_parts: list[str] = []
     if fault.get("virtual_address"):
@@ -196,8 +168,6 @@ def _build_gpu_error_event(
         "platform": "native",
         "level": "fatal",
         "timestamp": now.timestamp(),
-        # Verbatim teapot fingerprint → GPU crashes group on their own, apart
-        # from the CPU crash's stacktrace grouping.
         "fingerprint": fingerprint,
         "exception": {
             "values": [
@@ -267,14 +237,10 @@ def _merge_cpu_tags(
 
 
 def _markers_to_breadcrumbs(markers: Any) -> list[dict[str, Any]]:
-    """Map teapot's `markers` array to Sentry event breadcrumbs.
+    """Map teapot's `markers` to breadcrumbs.
 
-    For non-shader crashes (page faults, OOM, device reset, ...) these
-    are usually the only actionable signal — Aftermath captures the
-    CPU-side context that submitted the faulting GPU work via
-    `Aftermath markers` and `UserDefined+N` description keys. Surfacing
-    them as breadcrumbs puts them in the standard issue-page timeline
-    rather than buried in a context blob.
+    For non-shader crashes these are often the only actionable signal (the
+    CPU-side context that submitted the faulting GPU work).
     """
 
     if not isinstance(markers, list):
@@ -300,23 +266,12 @@ def _markers_to_breadcrumbs(markers: Any) -> list[dict[str, Any]]:
 
 
 def _normalize_gpu_frames(teapot_frames: Any) -> list[dict[str, Any]]:
-    """Map teapot's ``frames[]`` to Sentry event stacktrace frames.
+    """Map teapot's ``frames[]`` to Sentry stacktrace frames.
 
-    Teapot now emits frames with all the relevant fields pre-populated —
-    `function`, `module`, `filename`, `abs_path`, `lineno`, and
-    `data.synthetic` — so this is mostly a pass-through with a couple
-    of normalisations:
-
-    * Mark every frame `symbolicator_status=symbolicated` so Sentry's
-      UI doesn't paint the warning triangle (no `debug_meta.images`
-      entry exists for shader frames; without the explicit status the
-      symbolicator walker marks them `missing`).
-    * Synthesise a `package` from the shader hash so the frame's
-      module column renders something useful.
-
-    Synthetic frames (`data.synthetic = true`, emitted for non-shader
-    crashes like page faults) carry the same metadata shape; the only
-    difference is they have no `data.shader_hash`.
+    Mostly a pass-through of pre-populated fields, plus two normalisations:
+    force ``symbolicator_status=symbolicated`` (shader frames have no debug
+    image, so the walker would otherwise mark them missing), and synthesise a
+    ``package`` from the shader hash for the module column.
     """
 
     if not isinstance(teapot_frames, list):
@@ -343,20 +298,15 @@ def _normalize_gpu_frames(teapot_frames: Any) -> list[dict[str, Any]]:
             value = raw.get(src)
             if value is not None:
                 frame[dst] = value
-        # `data` comes from teapot's external response; only trust it if it's a
-        # mapping. A truthy non-dict (str/list) would crash both `dict(...)` and
-        # the `.get()` below.
+        # `data` is external; only trust it if it's a mapping (a truthy
+        # str/list would crash `dict(...)` and the `.get()` below).
         raw_data = raw.get("data")
         if not isinstance(raw_data, dict):
             raw_data = {}
         if raw_data:
             frame["data"] = dict(raw_data)
 
-        # Synthesise a package from the shader hash so the module column
-        # renders something useful (only for real shader frames; synthetic
-        # frames already have a meaningful `module` like "Graphics").
         shader_hash = raw_data.get("shader_hash")
-        # shader_hash comes from teapot's response; don't assume it's a str.
         if isinstance(shader_hash, str) and shader_hash and not frame.get("package"):
             frame["package"] = (
                 shader_hash if shader_hash.startswith("shader_") else f"shader_{shader_hash}"
